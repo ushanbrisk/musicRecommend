@@ -391,6 +391,216 @@ playback_completion_rate = (playback_duration_seconds / song_duration_seconds) *
 
 ---
 
+### 3.3 数据库存储选型分析
+
+#### 3.3.1 music_features 表存储选择：PostgreSQL vs 向量数据库
+
+**核心问题**：music_features 表中的 `feature_vector` 向量字段应该存在哪里？
+
+**方案对比：**
+
+| 维度 | PostgreSQL + pgvector | 专用向量数据库（Milvus/Pinecone等） |
+|------|------------------------|--------------------------------------|
+| **架构复杂度** | ⭐⭐ 低（单数据库） | ⭐⭐⭐⭐ 高（需维护独立服务） |
+| **成本** | ⭐⭐ 低（无需额外服务） | ⭐⭐⭐⭐ 高（云服务或自建集群） |
+| **查询性能** | ⭐⭐⭐ 中等 | ⭐⭐⭐⭐⭐ 优秀（针对向量优化） |
+| **扩展性** | ⭐⭐ 受限于PostgreSQL | ⭐⭐⭐⭐⭐ 按需扩展 |
+| **运维成本** | ⭐⭐ 低 | ⭐⭐⭐⭐ 高 |
+| **适用规模** | 百万级向量 | 千万级以上 |
+
+**本项目建议：PostgreSQL + pgvector（可选）**
+
+理由：
+1. **初版规模预估**：假设曲库10万首歌曲，向量维度1536
+   - 总存储：10万 × 1536 × 4字节 ≈ 600MB
+   - PostgreSQL 完全可承载
+
+2. **pgvector 能力**：
+   - 支持向量相似度搜索（余弦相似度、欧氏距离）
+   - 支持 HNSW 和 IVFFlat 索引
+   - 可处理百万级向量，延迟 < 100ms
+
+3. **运维简化**：与现有 PostgreSQL 统一管理，降低复杂度
+
+4. **扩展路径**：如果未来曲库规模超过500万首，再考虑迁移到专用向量数据库
+
+**pgvector 配置示例：**
+
+```sql
+-- 启用 pgvector 扩展
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 添加向量列（1536维，与 MiniMax embedding 维度对齐）
+ALTER TABLE music_features ADD COLUMN feature_vector vector(1536);
+
+-- 创建 HNSW 索引（适合追求查询速度的场景）
+CREATE INDEX idx_music_features_vector_hnsw
+ON music_features USING hnsw (feature_vector vector_cosine_ops);
+
+-- 或创建 IVFFlat 索引（适合数据量大、内存受限的场景）
+CREATE INDEX idx_music_features_vector_ivfflat
+ON music_features USING ivfflat (feature_vector vector_cosine_ops);
+```
+
+**是否启用向量检索的判断流程：**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     向量检索启用判断                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  曲库规模 <= 100万首？                                          │
+│         │                                                        │
+│    是 ◄─┴─► 否                                                  │
+│    │         │                                                   │
+│    ▼         ▼                                                   │
+│  PostgreSQL  考虑专用向量数据库                                  │
+│  + pgvector                                                │
+│                                                                  │
+│  是否需要高精度召回？                                            │
+│    是 ◄─┴─► 否                                                  │
+│    │         │                                                   │
+│    ▼         ▼                                                   │
+│  pgvector   纯标签匹配足够                                       │
+│  HNSW索引                                                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 3.3.2 推荐历史与反馈存储选择：数据量大时的应对策略
+
+**核心问题**：用户行为数据量持续增长，单表存储会成为瓶颈吗？
+
+**数据量预估：**
+
+| 指标 | 估算值 |
+|------|--------|
+| 日活用户 | 10,000 |
+| 每用户日均推荐查询 | 5 次 |
+| 每查询平均返回 | 15 首 |
+| 每首播放行为记录 | 1 条 |
+
+| 时间维度 | 预估数据量 |
+|----------|------------|
+| 每日新增 | 10,000 × 5 = 50,000 条 history |
+| 每日反馈 | 50,000 × 15 = 750,000 条 feedback |
+| 每月 | 约 2,250 万条 feedback |
+| 每年 | 约 2.7 亿条 feedback |
+
+**存储需求：**
+- feedback 表每条约 200 字节（包含多个字段）
+- 每年约 50GB 数据
+
+**方案对比：**
+
+| 方案 | 描述 | 优点 | 缺点 | 适用场景 |
+|------|------|------|------|----------|
+| **方案A：MongoDB** | 行为数据存 MongoDB | 扩展性强，Schema灵活 | 需要维护独立服务 | 大规模、灵活查询 |
+| **方案B：时序数据库** | 使用 TimescaleDB/InfluxDB | 内置时序优化、压缩 | 需额外学习 | 纯时序数据 |
+| **方案C：PostgreSQL 分区表** | 按时间分区 | 统一数据库，查询方便 | 分区管理复杂 | 中等规模（<1亿） |
+| **方案D：冷热分离** | 热数据PostgreSQL，冷数据归档 | 平衡性能和成本 | 实现复杂 | 大规模数据 |
+
+**本项目建议：方案C - PostgreSQL 分区表（初版）→ 方案A MongoDB（扩展）**
+
+**理由：**
+
+1. **初版规模（<100万用户）**：
+   - PostgreSQL 分区表完全可应对
+   - 按月分区，每年新增约 50GB
+   - 配合索引，查询性能可接受
+
+2. **PostgreSQL 分区表设计：**
+
+```sql
+-- 创建分区表（按月分区）
+CREATE TABLE recommendation_feedback (
+    id SERIAL,
+    history_id INTEGER,
+    song_id BIGINT,
+    playback_duration_seconds INTEGER,
+    song_duration_seconds INTEGER,
+    playback_completion_rate DECIMAL(5,2),
+    skipped BOOLEAN DEFAULT FALSE,
+    looped BOOLEAN DEFAULT FALSE,
+    feedback_type VARCHAR(20),
+    feedback_detail VARCHAR(100),
+    action_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    play_source VARCHAR(50),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id, action_timestamp)
+) PARTITION BY RANGE (action_timestamp);
+
+-- 创建月度分区
+CREATE TABLE recommendation_feedback_2025_01 PARTITION OF recommendation_feedback
+    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE recommendation_feedback_2025_02 PARTITION OF recommendation_feedback
+    FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+-- ... 以此类推
+
+-- 自动创建未来分区的函数
+CREATE OR REPLACE FUNCTION create_monthly_partition()
+RETURNS void AS $$
+DECLARE
+    next_month DATE;
+    partition_name TEXT;
+BEGIN
+    next_month := date_trunc('month', CURRENT_DATE + INTERVAL '1 month');
+    partition_name := 'recommendation_feedback_' || to_char(next_month, 'YYYY_MM');
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF recommendation_feedback
+         FOR VALUES FROM (%L) TO (%L)',
+        partition_name,
+        next_month,
+        next_month + INTERVAL '1 month'
+    );
+END;
+$$ LANGUAGE plpgsql;
+```
+
+3. **历史数据归档策略：**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      数据生命周期管理                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   热数据（< 3个月）    │   温数据（3-12个月）   │   冷数据（> 1年） │
+│   ─────────────────   │   ─────────────────   │   ─────────────  │
+│   PostgreSQL 主表     │   PostgreSQL 分区     │   归档到对象存储   │
+│   全量索引，高可用     │   减少索引，定期压缩    │   (S3/OSS)       │
+│                                                                  │
+│   用于实时推荐         │   用于分析统计         │   用于模型训练    │
+│   快速查询            │   趋势分析             │   历史样本        │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+4. **扩展路径**：当数据量超过 1 亿条或查询延迟明显上升时，再迁移到 MongoDB
+
+**MongoDB 迁移方案（预留）：**
+
+```javascript
+// MongoDB 集合设计
+db.recommendation_feedback.createIndex({ "history_id": 1, "song_id": 1 }, { unique: true });
+db.recommendation_feedback.createIndex({ "action_timestamp": 1 });
+db.recommendation_feedback.createIndex({ "song_id": 1, "playback_completion_rate": 1 });
+
+// 分片策略：按 user_id 或 time 进行分片
+sh.shardCollection("music_recommend.recommendation_feedback", { "user_id": "hashed" });
+```
+
+**总结：存储选型建议**
+
+| 数据表 | 初版存储 | 扩展存储 | 说明 |
+|--------|----------|----------|------|
+| `music_features` | PostgreSQL | PostgreSQL + pgvector | 10万首规模 PostgreSQL 足够 |
+| `recommendation_history` | PostgreSQL | PostgreSQL 分区表 | 按时间分区 |
+| `recommendation_feedback` | PostgreSQL 分区表 | MongoDB | 按月分区，年度归档 |
+
+---
+
 ## 4. 后端API设计
 
 ### 4.1 新增端点
@@ -488,9 +698,1248 @@ Request:
 
 ---
 
-## 6. 实现步骤（待审批）
+## 6. 实现步骤（详细）
 
-（略，待1.2、2、3.1、3.2、5.1审核通过后补充）
+### 6.1 阶段一：环境准备与基础设施（预计工作量：1-2天）
+
+#### 6.1.1 后端环境检查
+
+**目标**：确认后端项目结构和依赖
+
+**执行步骤**：
+
+1. **检查现有项目结构**
+   ```bash
+   cd /path/to/music-project/backend
+   ls -la
+   # 确认存在: app.py, requirements.txt, .env 等文件
+   ```
+
+2. **检查 Python 版本和依赖**
+   ```bash
+   python3 --version  # 需 >= 3.9
+   pip3 list | grep -E "Flask|psycopg2|pymongo"
+   ```
+
+3. **安装必要依赖**
+   ```bash
+   pip3 install flask psycopg2-binary pymongo redis minimax-api python-dotenv
+   ```
+
+4. **配置 .env 文件**（参考 8.配置文件更新）
+
+#### 6.1.2 MiniMax API 账号准备
+
+**目标**：获取 MiniMax API Key 并测试连通性
+
+**执行步骤**：
+
+1. 联系项目负责人获取 MiniMax API Key
+2. 测试 API 连通性：
+   ```python
+   from minimax import MiniMax
+
+   client = MiniMax(api_key="your_key")
+   # 测试 chat API
+   response = client.chat.completions.create(
+       model="abab6.5s-chat",
+       messages=[{"role": "user", "content": "你好"}]
+   )
+   print(response.choices[0].message.content)
+   ```
+
+3. 确认 embedding API 可用：
+   ```python
+   # 测试 embedding
+   embedding = client.embeddings.create(
+       model="embo-01",
+       input="测试文本"
+   )
+   print(len(embedding.data[0].embedding))
+   ```
+
+#### 6.1.3 前端环境检查
+
+**目标**：确认 UniApp 项目可运行
+
+**执行步骤**：
+
+1. **检查 Node.js 环境**
+   ```bash
+   node --version  # 需 >= 16
+   npm --version
+   ```
+
+2. **检查 UniApp CLI**
+   ```bash
+   npx vue --version
+   # 或
+   npm install -g @vue/cli
+   ```
+
+3. **安装项目依赖**
+   ```bash
+   cd /path/to/music-project-uniapp
+   npm install
+   ```
+
+---
+
+### 6.2 阶段二：数据库设计与创建（预计工作量：1-2天）
+
+#### 6.2.1 创建 PostgreSQL 数据库表
+
+**目标**：在 PostgreSQL 中创建 music_features 和 recommendation_history 表
+
+**执行步骤**：
+
+1. **连接到 PostgreSQL**
+   ```bash
+   psql -h localhost -U postgres -d music_db
+   # 或使用管理工具（如 pgAdmin、DBeaver）
+   ```
+
+2. **创建 music_features 表**
+   ```sql
+   CREATE TABLE music_features (
+       id SERIAL PRIMARY KEY,
+       song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
+
+       -- 基础特征
+       genre VARCHAR(100),
+       mood VARCHAR(200),
+       tempo VARCHAR(50),
+       instruments VARCHAR(200),
+       scene VARCHAR(200),
+       language VARCHAR(50),
+       era VARCHAR(50),
+
+       -- 复杂特征
+       description TEXT,
+       emotional_tags VARCHAR(500),
+       theme_keywords VARCHAR(500),
+
+       -- 扩展信息
+       inherited_tags VARCHAR(500),
+
+       -- 向量表示（可选，初版先不启用）
+       -- feature_vector vector(1536),
+
+       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   );
+
+   -- 创建索引
+   CREATE INDEX idx_music_features_genre ON music_features(genre);
+   CREATE INDEX idx_music_features_mood ON music_features(mood);
+   CREATE INDEX idx_music_features_scene ON music_features(scene);
+   CREATE INDEX idx_music_features_song_id ON music_features(song_id);
+   ```
+
+3. **创建 recommendation_history 表**
+   ```sql
+   CREATE TABLE recommendation_history (
+       id SERIAL PRIMARY KEY,
+       session_id VARCHAR(100),
+       user_id VARCHAR(100),
+
+       query_text TEXT NOT NULL,
+       query_type VARCHAR(50),
+       query_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+       result_count INTEGER,
+       result_song_ids BIGINT[],
+       latency_ms INTEGER,
+
+       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   );
+
+   -- 创建索引
+   CREATE INDEX idx_history_session ON recommendation_history(session_id);
+   CREATE INDEX idx_history_user ON recommendation_history(user_id);
+   CREATE INDEX idx_history_query_time ON recommendation_history(query_timestamp);
+   ```
+
+4. **创建 recommendation_feedback 分区表**（初版先用普通表）
+   ```sql
+   CREATE TABLE recommendation_feedback (
+       id SERIAL PRIMARY KEY,
+       history_id INTEGER REFERENCES recommendation_history(id) ON DELETE CASCADE,
+       song_id BIGINT NOT NULL,
+
+       playback_duration_seconds INTEGER,
+       song_duration_seconds INTEGER,
+       playback_completion_rate DECIMAL(5,2),
+       skipped BOOLEAN DEFAULT FALSE,
+       looped BOOLEAN DEFAULT FALSE,
+
+       feedback_type VARCHAR(20),
+       feedback_detail VARCHAR(100),
+       action_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+       play_source VARCHAR(50),
+
+       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+       UNIQUE(history_id, song_id)
+   );
+
+   -- 创建索引
+   CREATE INDEX idx_feedback_history ON recommendation_feedback(history_id);
+   CREATE INDEX idx_feedback_song ON recommendation_feedback(song_id);
+   CREATE INDEX idx_feedback_type ON recommendation_feedback(feedback_type);
+   CREATE INDEX idx_feedback_skipped ON recommendation_feedback(skipped);
+   CREATE INDEX idx_feedback_completion ON recommendation_feedback(playback_completion_rate);
+   ```
+
+5. **验证表创建成功**
+   ```sql
+   \dt music_features recommendation_history recommendation_feedback
+   ```
+
+#### 6.2.2 创建 MongoDB 索引（如使用 MongoDB 存储评论）
+
+**目标**：确保评论集合有适当索引
+
+```javascript
+// 在 MongoDB shell 中执行
+use music_comments
+
+db.comments.createIndex({ "song_id": 1 })
+db.comments.createIndex({ "sentiment": 1, "polarity": 1 })
+```
+
+---
+
+### 6.3 阶段三：后端核心功能开发（预计工作量：4-6天）
+
+#### 6.3.1 MiniMax API 封装模块
+
+**目标**：创建 `backend/services/llm_service.py`，封装 LLM 调用
+
+**文件结构**：
+```
+backend/
+├── services/
+│   ├── __init__.py
+│   ├── llm_service.py      # MiniMax API 封装
+│   ├── feature_service.py   # 歌曲特征服务
+│   └── recommend_service.py # 推荐服务
+├── routes/
+│   ├── __init__.py
+│   └── recommend.py         # 推荐 API 路由
+└── models/
+    ├── __init__.py
+    └── database.py           # 数据库连接
+```
+
+**llm_service.py 实现要点**：
+```python
+# backend/services/llm_service.py
+
+import os
+from minimax import MiniMax
+from typing import List, Dict, Optional
+
+class LLMService:
+    def __init__(self):
+        self.client = MiniMax(
+            api_key=os.getenv("MINIMAX_API_KEY"),
+            base_url="https://api.minimax.chat"
+        )
+        self.model = os.getenv("MINIMAX_MODEL", "abab6.5s-chat")
+        self.embedding_model = os.getenv("MINIMAX_EMBEDDING_MODEL", "embo-01")
+
+    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+        """发送对话请求"""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature
+        )
+        return response.choices[0].message.content
+
+    def extract_features_prompt(self, song_info: Dict) -> str:
+        """构建特征提取 Prompt"""
+        return f"""请分析以下歌曲信息，提取特征标签。
+
+歌曲名称：{song_info['song_name']}
+艺术家：{song_info['artist']}
+专辑：{song_info.get('album', '未知')}
+歌单标签：{song_info.get('playlist_names', '无')}
+用户评论摘要：{song_info.get('comment_summary', '无')}
+
+请提取以下信息（JSON格式）：
+- genre: 流派/风格
+- mood: 情绪标签（最多5个，用逗号分隔）
+- tempo: 节拍（快/中/慢）
+- instruments: 主要乐器（最多3个，用逗号分隔）
+- scene: 适用场景（最多5个，用逗号分隔）
+- language: 语言
+- era: 年代
+- description: 100字左右的歌曲描述
+"""
+
+    def generate_embedding(self, text: str) -> List[float]:
+        """生成文本 embedding"""
+        response = self.client.embeddings.create(
+            model=self.embedding_model,
+            input=text
+        )
+        return response.data[0].embedding
+
+    def match_songs_prompt(self, query: str, songs_context: str) -> str:
+        """构建歌曲匹配 Prompt"""
+        return f"""用户查询："{query}"
+
+候选歌曲信息：
+{songs_context}
+
+请从候选歌曲中选择最匹配用户查询的歌曲，返回 JSON 格式：
+{{
+  "matched_songs": [
+    {{
+      "song_id": 123,
+      "match_score": 0.95,
+      "match_reason": "匹配原因说明"
+    }}
+  ]
+}}
+
+注意：只返回匹配度 >= 0.6 的歌曲，最多返回20首。
+"""
+```
+
+#### 6.3.2 歌曲特征批量生成服务
+
+**目标**：创建 `backend/services/feature_service.py`，批量生成歌曲特征
+
+**feature_service.py 实现要点**：
+```python
+# backend/services/feature_service.py
+
+from typing import List, Dict
+import psycopg2
+from .llm_service import LLMService
+import json
+
+class FeatureService:
+    def __init__(self, db_connection):
+        self.db = db_connection
+        self.llm = LLMService()
+
+    def get_songs_without_features(self, limit: int = 100) -> List[Dict]:
+        """获取尚未生成特征的歌曲"""
+        query = """
+            SELECT s.song_id, s.song_name, s.artist, s.album,
+                   ARRAY_AGG(DISTINCT p.playlist_name) as playlist_names
+            FROM songs s
+            LEFT JOIN music_features mf ON s.song_id = mf.song_id
+            LEFT JOIN song_playlist sp ON s.song_id = sp.song_id
+            LEFT JOIN playlists p ON sp.playlist_id = p.playlist_id
+            WHERE mf.id IS NULL
+            GROUP BY s.song_id, s.song_name, s.artist, s.album
+            LIMIT %s
+        """
+        # 执行查询...
+
+    def generate_feature_for_song(self, song_info: Dict) -> Dict:
+        """为单首歌曲生成特征"""
+        prompt = self.llm.extract_features_prompt(song_info)
+        response = self.llm.chat([{"role": "user", "content": prompt}])
+
+        # 解析 LLM 返回的 JSON
+        features = json.loads(response)
+        features['song_id'] = song_info['song_id']
+        return features
+
+    def batch_generate_features(self, batch_size: int = 50):
+        """批量生成特征（供定时任务调用）"""
+        songs = self.get_songs_without_features(limit=batch_size)
+        for song in songs:
+            features = self.generate_feature_for_song(song)
+            self.save_feature(features)
+            print(f"Generated features for song_id: {song['song_id']}")
+
+    def save_feature(self, features: Dict):
+        """保存特征到数据库"""
+        query = """
+            INSERT INTO music_features (
+                song_id, genre, mood, tempo, instruments,
+                scene, language, era, description,
+                emotional_tags, theme_keywords, inherited_tags
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        # 执行插入...
+
+    def search_by_tags(self, tags: List[str], limit: int = 20) -> List[Dict]:
+        """基于标签搜索歌曲"""
+        # 使用 PostgreSQL 的 LIKE 或数组包含查询
+        # ...
+```
+
+#### 6.3.3 推荐服务核心逻辑
+
+**目标**：创建 `backend/services/recommend_service.py`，实现推荐算法
+
+**recommend_service.py 实现要点**：
+```python
+# backend/services/recommend_service.py
+
+from typing import List, Dict, Optional
+import time
+from .llm_service import LLMService
+from .feature_service import FeatureService
+
+class RecommendService:
+    def __init__(self, db_connection):
+        self.db = db_connection
+        self.llm = LLMService()
+        self.feature_service = FeatureService(db_connection)
+
+    def recommend(self, query: str, session_id: str = None,
+                  max_results: int = 20, user_id: str = None) -> Dict:
+        """核心推荐方法"""
+
+        start_time = time.time()
+
+        # 1. 识别查询类型
+        query_type = self.classify_query(query)
+
+        # 2. 获取候选歌曲（从 music_features 表）
+        candidates = self.get_candidates(query_type)
+
+        # 3. 构建上下文，让 LLM 匹配
+        songs_context = self.build_songs_context(candidates)
+
+        # 4. 调用 LLM 进行语义匹配
+        match_result = self.llm_match(query, songs_context)
+
+        # 5. 记录推荐历史
+        history_id = self.save_history(
+            session_id=session_id,
+            user_id=user_id,
+            query_text=query,
+            query_type=query_type,
+            result_song_ids=[r['song_id'] for r in match_result],
+            latency_ms=int((time.time() - start_time) * 1000)
+        )
+
+        # 6. 构建返回结果
+        return self.build_response(
+            query=query,
+            query_type=query_type,
+            matches=match_result,
+            history_id=history_id,
+            latency_ms=int((time.time() - start_time) * 1000)
+        )
+
+    def classify_query(self, query: str) -> str:
+        """识别查询类型"""
+        # 简单场景描述 -> simple
+        # 复杂情感描述 -> complex
+        # 古诗词 -> poem
+        # 语音输入 -> voice
+        if len(query) < 20 and any(kw in query for kw in ['音乐', '歌曲']):
+            return 'simple'
+        elif any(char in query for char in ['，', '。', '、', '兮', '吾']):
+            return 'poem'
+        return 'complex'
+
+    def get_candidates(self, query_type: str, limit: int = 500) -> List[Dict]:
+        """获取候选歌曲"""
+        # 从 music_features 表获取候选
+        query = """
+            SELECT mf.*, s.song_name, s.artist, s.album, s.music_file
+            FROM music_features mf
+            JOIN songs s ON mf.song_id = s.song_id
+            ORDER BY RANDOM()
+            LIMIT %s
+        """
+        # 执行查询并返回...
+
+    def build_songs_context(self, candidates: List[Dict]) -> str:
+        """构建发送给 LLM 的歌曲上下文"""
+        context_lines = []
+        for song in candidates[:100]:  # 限制数量，避免 token 过多
+            line = f"song_id: {song['song_id']}, " \
+                   f"名称: {song['song_name']}, " \
+                   f"艺术家: {song['artist']}, " \
+                   f"风格: {song.get('genre', '未知')}, " \
+                   f"情绪: {song.get('mood', '未知')}, " \
+                   f"场景: {song.get('scene', '未知')}"
+            context_lines.append(line)
+        return "\n".join(context_lines)
+
+    def llm_match(self, query: str, songs_context: str) -> List[Dict]:
+        """LLM 语义匹配"""
+        prompt = self.llm.match_songs_prompt(query, songs_context)
+        response = self.llm.chat([{"role": "user", "content": prompt}])
+
+        # 解析返回的 JSON
+        result = json.loads(response)
+        return result.get('matched_songs', [])
+
+    def build_response(self, query: str, query_type: str,
+                      matches: List[Dict], history_id: int,
+                      latency_ms: int) -> Dict:
+        """构建 API 响应"""
+        # 填充完整的歌曲信息...
+        results = []
+        for match in matches:
+            song = self.get_song_detail(match['song_id'])
+            results.append({
+                "song_id": song['song_id'],
+                "song_name": song['song_name'],
+                "artist": song['artist'],
+                "album": song['album'],
+                "music_file": song['music_file'],
+                "match_score": match['match_score'],
+                "match_reason": match.get('match_reason', ''),
+                "tags": [song.get('genre', ''), song.get('mood', '')]
+            })
+
+        return {
+            "success": True,
+            "query": query,
+            "query_type": query_type,
+            "results": results,
+            "total": len(results),
+            "history_id": history_id,
+            "latency_ms": latency_ms
+        }
+```
+
+#### 6.3.4 API 路由开发
+
+**目标**：创建 `backend/routes/recommend.py`，暴露 REST API
+
+**recommend.py 实现要点**：
+```python
+# backend/routes/recommend.py
+
+from flask import Blueprint, request, jsonify
+from services.recommend_service import RecommendService
+from services.feature_service import FeatureService
+from models.database import get_db_connection
+import psycopg2
+
+recommend_bp = Blueprint('recommend', __name__, url_prefix='/api')
+
+def get_recommend_service():
+    db = get_db_connection()
+    return RecommendService(db)
+
+@recommend_bp.route('/recommend', methods=['POST'])
+def recommend():
+    """POST /api/recommend - 文本推荐接口"""
+    data = request.get_json()
+
+    query = data.get('query', '').strip()
+    if not query:
+        return jsonify({"success": False, "error": "查询文本不能为空"}), 400
+
+    session_id = data.get('session_id')
+    max_results = data.get('max_results', 20)
+    user_id = data.get('user_id')
+
+    service = get_recommend_service()
+    result = service.recommend(
+        query=query,
+        session_id=session_id,
+        max_results=max_results,
+        user_id=user_id
+    )
+
+    return jsonify(result)
+
+@recommend_bp.route('/recommend/feedback', methods=['POST'])
+def submit_feedback():
+    """POST /api/recommend/feedback - 提交推荐反馈"""
+    data = request.get_json()
+
+    required_fields = ['history_id', 'song_id']
+    for field in required_fields:
+        if field not in data:
+            return jsonify({"success": False, "error": f"缺少必填字段: {field}"}), 400
+
+    db = get_db_connection()
+    cursor = db.cursor()
+
+    query = """
+        INSERT INTO recommendation_feedback (
+            history_id, song_id, playback_duration_seconds,
+            song_duration_seconds, playback_completion_rate,
+            skipped, looped, feedback_type, feedback_detail, play_source
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (history_id, song_id) DO UPDATE SET
+            playback_duration_seconds = EXCLUDED.playback_duration_seconds,
+            song_duration_seconds = EXCLUDED.song_duration_seconds,
+            playback_completion_rate = EXCLUDED.playback_completion_rate,
+            skipped = EXCLUDED.skipped,
+            looped = EXCLUDED.looped,
+            feedback_type = COALESCE(EXCLUDED.feedback_type, recommendation_feedback.feedback_type),
+            action_timestamp = CURRENT_TIMESTAMP
+    """
+
+    cursor.execute(query, (
+        data['history_id'],
+        data['song_id'],
+        data.get('playback_duration_seconds'),
+        data.get('song_duration_seconds'),
+        data.get('playback_completion_rate'),
+        data.get('skipped', False),
+        data.get('looped', False),
+        data.get('feedback_type'),
+        data.get('feedback_detail'),
+        data.get('play_source', 'recommend')
+    ))
+
+    db.commit()
+    return jsonify({"success": True})
+
+@recommend_bp.route('/recommend/history', methods=['GET'])
+def get_history():
+    """GET /api/recommend/history - 获取推荐历史"""
+    session_id = request.args.get('session_id')
+    user_id = request.args.get('user_id')
+    limit = request.args.get('limit', 20, type=int)
+
+    if not session_id and not user_id:
+        return jsonify({"success": False, "error": "需要 session_id 或 user_id"}), 400
+
+    db = get_db_connection()
+    cursor = db.cursor()
+
+    query = """
+        SELECT id, query_text, query_type, query_timestamp,
+               result_count, latency_ms
+        FROM recommendation_history
+        WHERE (%s IS NOT NULL AND session_id = %s)
+           OR (%s IS NOT NULL AND user_id = %s)
+        ORDER BY query_timestamp DESC
+        LIMIT %s
+    """
+
+    cursor.execute(query, (session_id, session_id, user_id, user_id, limit))
+    rows = cursor.fetchall()
+
+    history = [{
+        "id": row[0],
+        "query_text": row[1],
+        "query_type": row[2],
+        "query_timestamp": row[3].isoformat(),
+        "result_count": row[4],
+        "latency_ms": row[5]
+    } for row in rows]
+
+    return jsonify({"success": True, "history": history})
+
+@recommend_bp.route('/songs/<int:song_id>/features', methods=['GET'])
+def get_song_features(song_id):
+    """GET /api/songs/<song_id>/features - 获取歌曲特征"""
+    db = get_db_connection()
+    cursor = db.cursor()
+
+    query = """
+        SELECT song_id, genre, mood, tempo, instruments,
+               scene, language, era, description,
+               emotional_tags, theme_keywords, inherited_tags
+        FROM music_features
+        WHERE song_id = %s
+    """
+
+    cursor.execute(query, (song_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        return jsonify({"success": False, "error": "歌曲特征不存在"}), 404
+
+    features = {
+        "song_id": row[0],
+        "genre": row[1],
+        "mood": row[2],
+        "tempo": row[3],
+        "instruments": row[4],
+        "scene": row[5],
+        "language": row[6],
+        "era": row[7],
+        "description": row[8],
+        "emotional_tags": row[9],
+        "theme_keywords": row[10],
+        "inherited_tags": row[11]
+    }
+
+    return jsonify({"success": True, "features": features})
+
+@recommend_bp.route('/features/generate', methods=['POST'])
+def generate_features():
+    """POST /api/features/generate - 批量生成歌曲特征（管理员）"""
+    data = request.get_json()
+    batch_size = data.get('batch_size', 50)
+
+    service = FeatureService(get_db_connection())
+    service.batch_generate_features(batch_size=batch_size)
+
+    return jsonify({"success": True, "message": f"已提交生成任务，批次大小: {batch_size}"})
+```
+
+#### 6.3.5 数据库连接模块
+
+**目标**：创建 `backend/models/database.py`，统一管理数据库连接
+
+```python
+# backend/models/database.py
+
+import psycopg2
+from contextlib import contextmanager
+import os
+
+def get_db_connection():
+    """获取 PostgreSQL 连接"""
+    return psycopg2.connect(
+        host=os.getenv('POSTGRES_HOST', 'localhost'),
+        port=os.getenv('POSTGRES_PORT', 5432),
+        database=os.getenv('POSTGRES_DB', 'music_db'),
+        user=os.getenv('POSTGRES_USER', 'postgres'),
+        password=os.getenv('POSTGRES_PASSWORD', '')
+    )
+
+@contextmanager
+def get_db_cursor():
+    """上下文管理器，自动管理数据库连接"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        yield cursor
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cursor.close()
+        conn.close()
+```
+
+---
+
+### 6.4 阶段四：后端 API 集成与注册（预计工作量：0.5天）
+
+#### 6.4.1 注册 Blueprint 到 Flask App
+
+**目标**：在 `app.py` 中注册推荐 API
+
+```python
+# backend/app.py (示例修改)
+
+from routes.recommend import recommend_bp
+
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object('config')
+
+    # 注册推荐 API Blueprint
+    app.register_blueprint(recommend_bp)
+
+    # ... 其他现有代码
+
+    return app
+
+if __name__ == '__main__':
+    app = create_app()
+    app.run(host='0.0.0.0', port=5000, debug=True)
+```
+
+#### 6.4.2 验证 API 可用性
+
+```bash
+# 启动后端服务
+cd backend
+python app.py
+
+# 测试推荐接口
+curl -X POST http://localhost:5000/api/recommend \
+  -H "Content-Type: application/json" \
+  -d '{"query": "欢快的凯尔特音乐", "session_id": "test_001"}'
+
+# 测试健康检查
+curl http://localhost:5000/api/health
+```
+
+---
+
+### 6.5 阶段五：前端开发（预计工作量：3-4天）
+
+#### 6.5.1 创建推荐页面
+
+**目标**：创建 `/pages/recommend/recommend.vue`
+
+**文件结构**：
+```
+music-project-uniapp/
+├── pages/
+│   ├── recommend/
+│   │   └── recommend.vue    # 推荐页面
+│   └── index/
+│       └── index.vue        # 修改首页，添加入口
+├── components/
+│   └── RecommendCard.vue     # 推荐结果卡片
+└── api/
+    └── recommend.js          # API 调用封装
+```
+
+#### 6.5.2 API 封装
+
+**api/recommend.js**：
+```javascript
+// api/recommend.js
+
+const API_BASE = 'http://localhost:5000/api'
+
+export const recommendApi = {
+  /**
+   * 文本推荐
+   * @param {string} query - 推荐查询文本
+   * @param {string} sessionId - 会话ID
+   * @param {number} maxResults - 最大返回数量
+   */
+  recommend(query, sessionId, maxResults = 20) {
+    return uni.request({
+      url: `${API_BASE}/recommend`,
+      method: 'POST',
+      data: {
+        query,
+        session_id: sessionId,
+        max_results: maxResults
+      }
+    })
+  },
+
+  /**
+   * 提交推荐反馈
+   * @param {Object} feedback - 反馈数据
+   */
+  submitFeedback(feedback) {
+    return uni.request({
+      url: `${API_BASE}/recommend/feedback`,
+      method: 'POST',
+      data: feedback
+    })
+  },
+
+  /**
+   * 获取推荐历史
+   * @param {string} sessionId - 会话ID
+   */
+  getHistory(sessionId) {
+    return uni.request({
+      url: `${API_BASE}/recommend/history`,
+      method: 'GET',
+      data: { session_id: sessionId }
+    })
+  }
+}
+```
+
+#### 6.5.3 推荐页面实现
+
+**pages/recommend/recommend.vue** 核心逻辑：
+
+```vue
+<template>
+  <view class="recommend-page">
+    <!-- 搜索输入区 -->
+    <view class="search-section">
+      <textarea
+        class="search-input"
+        v-model="queryText"
+        placeholder="请描述你想要的音乐...（如：欢快的凯尔特音乐）"
+        :disabled="loading"
+      />
+      <view class="search-actions">
+        <button
+          class="voice-btn"
+          @click="toggleVoiceInput"
+          :class="{ active: voiceInputActive }"
+        >
+          🎤 语音
+        </button>
+        <button
+          class="search-btn"
+          @click="handleSearch"
+          :disabled="!queryText.trim() || loading"
+        >
+          {{ loading ? '搜索中...' : '搜索' }}
+        </button>
+      </view>
+    </view>
+
+    <!-- 推荐结果列表 -->
+    <view class="results-section" v-if="results.length > 0">
+      <view class="result-item" v-for="item in results" :key="item.song_id">
+        <RecommendCard
+          :song="item"
+          :history-id="historyId"
+          @play="handlePlay"
+          @feedback="handleFeedback"
+        />
+      </view>
+    </view>
+
+    <!-- 空状态 -->
+    <view class="empty-state" v-else-if="!loading && searched">
+      <text>未找到匹配的音乐，请尝试其他描述</text>
+    </view>
+  </view>
+</template>
+
+<script>
+import { recommendApi } from '@/api/recommend'
+
+export default {
+  data() {
+    return {
+      queryText: '',
+      sessionId: '',
+      historyId: null,
+      loading: false,
+      searched: false,
+      results: [],
+      voiceInputActive: false
+    }
+  },
+
+  onLoad() {
+    // 生成或获取 sessionId
+    this.sessionId = uni.getStorageSync('recommend_session_id')
+    if (!this.sessionId) {
+      this.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9)
+      uni.setStorageSync('recommend_session_id', this.sessionId)
+    }
+  },
+
+  methods: {
+    async handleSearch() {
+      if (!this.queryText.trim()) return
+
+      this.loading = true
+      this.searched = true
+
+      try {
+        const response = await recommendApi.recommend(
+          this.queryText,
+          this.sessionId,
+          20
+        )
+
+        if (response.data.success) {
+          this.results = response.data.results
+          this.historyId = response.data.history_id
+        } else {
+          uni.showToast({
+            title: response.data.error || '推荐失败',
+            icon: 'none'
+          })
+        }
+      } catch (error) {
+        uni.showToast({
+          title: '网络错误，请稍后重试',
+          icon: 'none'
+        })
+      } finally {
+        this.loading = false
+      }
+    },
+
+    handlePlay(song) {
+      // 调用播放器播放
+      uni.navigateTo({
+        url: `/pages/player/player?song_id=${song.song_id}`
+      })
+    },
+
+    async handleFeedback({ song, feedbackType }) {
+      // 上报反馈
+      await recommendApi.submitFeedback({
+        history_id: this.historyId,
+        song_id: song.song_id,
+        feedback_type: feedbackType,
+        play_source: 'recommend'
+      })
+    },
+
+    toggleVoiceInput() {
+      // TODO: 实现语音输入
+      this.voiceInputActive = !this.voiceInputActive
+    }
+  }
+}
+</script>
+```
+
+#### 6.5.4 推荐卡片组件
+
+**components/RecommendCard.vue**：
+
+```vue
+<template>
+  <view class="recommend-card">
+    <view class="song-info" @click="$emit('play', song)">
+      <image class="album-art" src="/static/default-album.png" mode="aspectFill" />
+      <view class="song-detail">
+        <text class="song-name">{{ song.song_name }}</text>
+        <text class="artist">{{ song.artist }}</text>
+        <view class="tags">
+          <text class="tag" v-for="tag in validTags" :key="tag">{{ tag }}</text>
+        </view>
+        <text class="match-reason" v-if="song.match_reason">{{ song.match_reason }}</text>
+      </view>
+    </view>
+    <view class="actions">
+      <button class="action-btn like" @click="onLike">👍 喜欢</button>
+      <button class="action-btn skip" @click="onSkip">跳过</button>
+    </view>
+  </view>
+</template>
+
+<script>
+export default {
+  props: {
+    song: {
+      type: Object,
+      required: true
+    },
+    historyId: {
+      type: Number,
+      required: true
+    }
+  },
+
+  computed: {
+    validTags() {
+      return (this.song.tags || []).filter(tag => tag && tag !== '未知')
+    }
+  },
+
+  methods: {
+    onLike() {
+      this.$emit('feedback', { song: this.song, feedbackType: 'like' })
+      uni.showToast({ title: '已记录喜欢', icon: 'success' })
+    },
+
+    onSkip() {
+      this.$emit('feedback', { song: this.song, feedbackType: 'dislike' })
+    }
+  }
+}
+</script>
+```
+
+#### 6.5.5 首页添加 AI 推荐入口
+
+**pages/index/index.vue** 修改：
+
+```vue
+<template>
+  <!-- 在现有首页基础上添加 AI 推荐入口 -->
+  <view class="index-page">
+    <!-- 现有内容... -->
+
+    <!-- AI 推荐入口 -->
+    <view class="ai-recommend-entry" @click="goToRecommend">
+      <image class="entry-icon" src="/static/ai-icon.png" />
+      <view class="entry-info">
+        <text class="entry-title">AI 智能推荐</text>
+        <text class="entry-desc">用文字描述你想要音乐</text>
+      </view>
+      <text class="entry-arrow">›</text>
+    </view>
+
+    <!-- 现有其他内容... -->
+  </view>
+</template>
+
+<script>
+export default {
+  methods: {
+    goToRecommend() {
+      uni.navigateTo({
+        url: '/pages/recommend/recommend'
+      })
+    }
+  }
+}
+</script>
+```
+
+#### 6.5.6 前端播放器行为上报
+
+**播放器组件修改**（播放反馈上报）：
+
+```javascript
+// 在播放器组件中，歌曲播放完成或被跳过时上报
+
+methods: {
+  onSongEnd() {
+    this.reportPlaybackFeedback({
+      playback_duration_seconds: this.currentDuration,
+      song_duration_seconds: this.totalDuration,
+      playback_completion_rate: (this.currentDuration / this.totalDuration) * 100,
+      skipped: false,
+      looped: false
+    })
+    this.playNext()
+  },
+
+  onSkip() {
+    this.reportPlaybackFeedback({
+      playback_duration_seconds: this.currentDuration,
+      song_duration_seconds: this.totalDuration,
+      playback_completion_rate: (this.currentDuration / this.totalDuration) * 100,
+      skipped: true,
+      looped: false
+    })
+    this.playNext()
+  },
+
+  reportPlaybackFeedback(playbackData) {
+    if (!this.historyId) return  // 只有推荐来源才上报
+
+    recommendApi.submitFeedback({
+      history_id: this.historyId,
+      song_id: this.currentSong.song_id,
+      ...playbackData,
+      play_source: 'recommend'
+    })
+  }
+}
+```
+
+---
+
+### 6.6 阶段六：测试与部署（预计工作量：2-3天）
+
+#### 6.6.1 单元测试
+
+**后端测试** (`backend/tests/test_recommend.py`)：
+
+```python
+import pytest
+from app import create_app
+
+@pytest.fixture
+def client():
+    app = create_app()
+    app.config['TESTING'] = True
+    with app.test_client() as client:
+        yield client
+
+def test_recommend_endpoint(client):
+    """测试推荐接口"""
+    response = client.post('/api/recommend', json={
+        'query': '欢快的凯尔特音乐',
+        'session_id': 'test_001'
+    })
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data['success'] == True
+    assert 'results' in data
+
+def test_feedback_endpoint(client):
+    """测试反馈接口"""
+    # 先创建推荐获取 history_id
+    rec_response = client.post('/api/recommend', json={
+        'query': '测试音乐',
+        'session_id': 'test_001'
+    })
+    history_id = rec_response.get_json()['history_id']
+
+    # 提交反馈
+    response = client.post('/api/recommend/feedback', json={
+        'history_id': history_id,
+        'song_id': 123456,
+        'playback_completion_rate': 85.5,
+        'skipped': False
+    })
+    assert response.status_code == 200
+```
+
+**前端测试**（使用 uni-app 内置测试或手动测试）
+
+#### 6.6.2 功能验证清单
+
+| 功能 | 验证点 | 状态 |
+|------|--------|------|
+| 推荐接口 | 输入"欢快的凯尔特音乐"返回匹配结果 | ☐ |
+| 推荐接口 | 输入古诗词"琵琶行"返回匹配结果 | ☐ |
+| 反馈接口 | 播放完成后正确上报播放完成度 | ☐ |
+| 反馈接口 | 点击跳过正确设置 skipped=true | ☐ |
+| 历史记录 | 同一 session_id 的查询历史正确关联 | ☐ |
+| 特征生成 | 批量生成接口可正常执行 | ☐ |
+
+#### 6.6.3 部署
+
+**后端部署**：
+
+```bash
+# 1. 安装 Gunicorn (生产环境)
+pip install gunicorn
+
+# 2. 启动服务
+gunicorn -w 4 -b 0.0.0.0:5000 app:app
+
+# 3. 使用 systemd 管理服务
+sudo tee /etc/systemd/system/music-recommend.service <<EOF
+[Unit]
+Description=Music Recommend Service
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/path/to/backend
+ExecStart=/usr/local/bin/gunicorn -w 4 -b 0.0.0.0:5000 app:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl enable music-recommend
+sudo systemctl start music-recommend
+```
+
+**前端部署**：
+
+```bash
+# H5 平台
+npm run build:h5
+
+# 微信小程序
+npm run build:mp-weixin
+# 然后在微信开发者工具中上传
+```
+
+---
+
+### 6.7 实现进度汇总
+
+| 阶段 | 工作内容 | 预计工时 | 依赖关系 |
+|------|----------|----------|----------|
+| **阶段一** | 环境准备与基础设施 | 1-2天 | 无 |
+| **阶段二** | 数据库设计与创建 | 1-2天 | 阶段一 |
+| **阶段三** | 后端核心功能开发 | 4-6天 | 阶段二 |
+| **阶段四** | 后端 API 集成 | 0.5天 | 阶段三 |
+| **阶段五** | 前端开发 | 3-4天 | 阶段四 |
+| **阶段六** | 测试与部署 | 2-3天 | 阶段五 |
+
+**总预计工时：11.5 - 17.5 人天**
+
+**里程碑**：
+
+1. **M1（阶段二完成后）**：数据库设计评审通过
+2. **M2（阶段四完成后）**：后端 API 可用
+3. **M3（阶段五完成后）**：前端页面可用
+4. **M4（阶段六完成后）**：功能测试通过，可上线
+
+---
 
 ---
 
