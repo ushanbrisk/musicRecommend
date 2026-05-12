@@ -958,24 +958,60 @@ class LLMService:
         return response.choices[0].message.content
 
     def extract_features_prompt(self, song_info: Dict) -> str:
-        """构建特征提取 Prompt"""
+        """构建特征提取 Prompt
+
+        注意：本方法仅基于文本信息提取特征，不涉及音频数据分析。
+        音频特征（节拍、调性、频谱等）作为后续扩展方向。
+        """
+        # 处理多个歌单名的情况
+        playlist_names = song_info.get('playlist_names', [])
+        if isinstance(playlist_names, list):
+            playlist_str = '、'.join(playlist_names)
+        else:
+            playlist_str = str(playlist_names)
+
+        # 处理多个评论摘要的情况
+        comment_summaries = song_info.get('comment_summaries', [])
+        if isinstance(comment_summaries, list):
+            comments_str = '；'.join(comment_summaries[:5])  # 最多取5条
+        else:
+            comments_str = str(comment_summaries)
+
         return f"""请分析以下歌曲信息，提取特征标签。
 
-歌曲名称：{song_info['song_name']}
-艺术家：{song_info['artist']}
-专辑：{song_info.get('album', '未知')}
-歌单标签：{song_info.get('playlist_names', '无')}
-用户评论摘要：{song_info.get('comment_summary', '无')}
+## 歌曲基本信息
+- 歌曲名称：{song_info['song_name']}
+- 艺术家：{song_info['artist']}
+- 专辑：{song_info.get('album', '未知')}
 
-请提取以下信息（JSON格式）：
-- genre: 流派/风格
-- mood: 情绪标签（最多5个，用逗号分隔）
-- tempo: 节拍（快/中/慢）
-- instruments: 主要乐器（最多3个，用逗号分隔）
-- scene: 适用场景（最多5个，用逗号分隔）
-- language: 语言
-- era: 年代
-- description: 100字左右的歌曲描述
+## 归属歌单（该歌曲可能出现在多个歌单中）
+{playlist_str if playlist_str else '无'}
+
+## 用户评论摘要（反映听众的真实感受）
+{comments_str if comments_str else '暂无评论'}
+
+## 已知信息（如有）
+- 语言：{song_info.get('language', '未知')}
+- 节拍：{song_info.get('tempo', '未知')}（如已知）
+
+请提取以下特征（JSON格式返回）：
+{{
+  "genre": "流派/风格，如：古典、流行、凯尔特、电子、爵士等",
+  "mood": "情绪标签（最多5个，用逗号分隔），如：欢快、忧伤、平静、激烈、浪漫、神秘、怀旧、励志、治愈等",
+  "tempo": "节拍：快/中/慢（如歌曲名含"快节奏"等信息可推断）",
+  "instruments": "主要乐器（最多3个，用逗号分隔），如：钢琴、吉他、鼓、弦乐、风笛、古筝等",
+  "scene": "适用场景（最多5个，用逗号分隔），如：夜晚、工作、运动、休息、阅读、旅行、聚会、独处、冥想等",
+  "language": "歌曲语言：中文、英文、日文、纯音乐等",
+  "era": "时代/年代，如：80年代、90年代、2000s、2010s、新世纪、古典时期等",
+  "description": "100字左右的歌曲描述，综合以上信息生成",
+  "emotional_tags": "细腻情感标签（更多细分情绪，用逗号分隔），如：乡愁、憧憬、释然、热血、孤独等",
+  "theme_keywords": "主题关键词（逗号分隔），如：自然、爱情、思乡、战争、和平等"
+}}
+
+注意：
+1. 一首歌可能属于多个歌单，歌单名传递了不同场景/情绪的语义
+2. 用户评论能反映真实感受，优先从评论中提取情绪和场景信息
+3. 仅基于文本信息推断，不要假设未知信息
 """
 
     def generate_embedding(self, text: str) -> List[float]:
@@ -1007,6 +1043,30 @@ class LLMService:
 注意：只返回匹配度 >= 0.6 的歌曲，最多返回20首。
 """
 ```
+
+**音频特征扩展（预留）**：
+
+如果未来需要引入音频分析，可在 `song_info` 中增加音频特征字段：
+
+```python
+# 预留：音频特征数据结构
+audio_features = {
+    "tempo_bpm": 120,           # 节拍 BPM
+    "key": "C Major",           # 调性
+    "energy": 0.7,              # 能量值 0-1
+    "danceability": 0.6,        # 可舞性 0-1
+    "valence": 0.5,             # 情感 valence 0-1
+    "instrumental": True,       # 是否纯音乐
+    "acoustic": 0.3,            # 原声程度 0-1
+}
+
+song_info_with_audio = {
+    # ... 文本信息 ...
+    "audio_features": audio_features
+}
+```
+
+---
 
 #### 6.3.2 歌曲特征批量生成服务
 

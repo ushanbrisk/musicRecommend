@@ -1,0 +1,1 @@
+1. 6.3.1中llm_service.py中， 类LLMService， 它的extract_features_prompt()方法，完全根据歌曲的名字，作者，专辑名字，歌单名字？用户评论摘要，这些文本信息来生成genre, mood, tempo, instruments, scene, language, era, description吗？ 也就是说不会考虑音乐本身的音频数据内容？ 另外，这里歌单名字， 我觉得需要考虑到一首歌会被包含在不同的歌单中。
