@@ -133,15 +133,101 @@
 
 #### 1.2.3 文本信息汇总与利用策略
 
-| 数据源 | 可提取的文本信息 | 提取方式 | 用途 |
-|--------|-----------------|----------|------|
-| `songs.song_name` | 歌曲名中的情绪词、类型词 | 关键词匹配 | 快速初筛 |
-| `songs.artist` | 艺术家类型（古典/流行/民族） | 映射表 | 辅助分类 |
-| `songs.album` | 专辑风格 | 关键词匹配 | 辅助分类 |
-| `playlists.playlist_name` | 场景、情绪、功能描述 | LLM提取 | 核心特征 |
-| `playlists.category` | 粗粒度分类 | 直接使用 | 快速过滤 |
-| `song_playlist` 关联 | 歌曲→场景的映射 | 歌单传递 | 标签传递 |
-| `comments.content` | 用户描述的场景/情绪/感受 | LLM提取 | 情感增强 |
+##### 1.2.3.1 数据关联关系
+
+各表之间通过 `song_id` 关联，形成以下数据关系：
+
+```
+songs (歌曲表)
+    │
+    ├── 1:N ─→ song_playlist (歌曲-歌单关联表)
+    │                 │
+    │                 └── N:1 ─→ playlists (歌单表)
+    │
+    └── 1:N ─→ comments (评论表，MongoDB)
+
+songs (歌曲表)
+    │
+    └── 1:1 ─→ music_features (音乐特征表)
+```
+
+##### 1.2.3.2 核心关联查询语句
+
+**查询1：获取歌曲的所有歌单名称**
+```sql
+-- 获取指定歌曲所属的所有歌单
+SELECT s.song_id, s.song_name,
+       ARRAY_AGG(p.playlist_name) AS playlist_names
+FROM songs s
+LEFT JOIN song_playlist sp ON s.song_id = sp.song_id
+LEFT JOIN playlists p ON sp.playlist_id = p.playlist_id
+WHERE s.song_id = 1893728473
+GROUP BY s.song_id, s.song_name;
+```
+
+**查询2：获取歌曲的所有评论**
+```sql
+-- 获取指定歌曲的用户评论（MongoDB）
+db.comments.find({ "song_id": 1893728473 }, { "content": 1, "sentiment": 1 })
+```
+
+**查询3：获取歌曲的完整文本信息（供LLM特征提取用）**
+```sql
+-- 获取单首歌曲的完整信息（文本信息来源）
+SELECT
+    s.song_id,
+    s.song_name,
+    s.artist,
+    s.album,
+    -- 聚合所有歌单名
+    COALESCE(
+        (SELECT ARRAY_AGG(p.playlist_name)
+         FROM song_playlist sp
+         JOIN playlists p ON sp.playlist_id = p.playlist_id
+         WHERE sp.song_id = s.song_id),
+        ARRAY[]::VARCHAR[]
+    ) AS playlist_names,
+    -- 聚合所有评论内容
+    COALESCE(
+        (SELECT ARRAY_AGG(c.content)
+         FROM comments c
+         WHERE c.song_id = s.song_id),
+        ARRAY[]::VARCHAR[]
+    ) AS comment_contents
+FROM songs s
+WHERE s.song_id = 1893728473;
+```
+
+**查询4：批量获取待提取特征的歌曲信息**
+```sql
+-- 获取尚未生成特征的歌曲，批量处理
+SELECT
+    s.song_id,
+    s.song_name,
+    s.artist,
+    s.album,
+    ARRAY_AGG(DISTINCT p.playlist_name) AS playlist_names,
+    ARRAY_AGG(DISTINCT c.content) AS comment_summaries
+FROM songs s
+LEFT JOIN music_features mf ON s.song_id = mf.song_id
+LEFT JOIN song_playlist sp ON s.song_id = sp.song_id
+LEFT JOIN playlists p ON sp.playlist_id = p.playlist_id
+LEFT JOIN comments c ON s.song_id = c.song_id
+WHERE mf.id IS NULL  -- 尚未生成特征
+GROUP BY s.song_id, s.song_name, s.artist, s.album
+LIMIT 100;
+```
+
+##### 1.2.3.3 文本信息汇总表
+
+| 数据源 | 可提取的文本信息 | 提取方式 | 关联方式 | 用途 |
+|--------|-----------------|----------|----------|------|
+| `songs.song_name` | 歌曲名中的情绪词、类型词 | 关键词匹配 | 直接获取 | 快速初筛 |
+| `songs.artist` | 艺术家类型（古典/流行/民族） | 映射表 | 直接获取 | 辅助分类 |
+| `songs.album` | 专辑风格 | 关键词匹配 | 直接获取 | 辅助分类 |
+| `playlists.playlist_name` | 场景、情绪、功能描述 | LLM提取 | 通过 `song_playlist` 关联获取 | 核心特征 |
+| `playlists.category` | 粗粒度分类 | 直接使用 | 通过 `song_playlist` 关联获取 | 快速过滤 |
+| `comments.content` | 用户描述的场景/情绪/感受 | LLM提取 | 通过 `song_id` 直接关联 | 情感增强 |
 
 ---
 
@@ -237,6 +323,51 @@ CREATE INDEX idx_music_features_song_id ON music_features(song_id);
 | `era` | 歌曲名（"80年代"）、艺术家年代 | 规则匹配+LLM |
 | `description` | 综合所有信息 | LLM生成 |
 | `inherited_tags` | 所属歌单的playlist_name | 从歌单关联提取 |
+
+---
+
+##### 3.1.1 特征提取时机
+
+音乐特征提取发生在以下场景：
+
+**场景1：新歌入库时（推荐）**
+
+当新歌曲添加到曲库时，通过定时任务或触发器自动提取特征。
+
+```
+新歌入库 → 检测到新song_id → 触发特征提取 → 存入music_features表
+```
+
+**触发方式**：
+- 方式A：定时任务（每小时/每天）扫描 `songs` 表，比对 `music_features` 表，找出缺失特征的歌曲批量处理
+- 方式B：歌曲入库后立即触发（如果 API 支持同步调用）
+
+**场景2：管理员手动触发**
+
+管理员可以通过 API 手动触发特征生成：
+
+```
+POST /api/features/generate
+{
+    "batch_size": 50,  // 可选，默认50
+    "song_ids": [123, 456]  // 可选，指定歌曲ID，不指定则处理所有未提取的
+}
+```
+
+**场景3：歌曲信息变更时**
+
+当歌曲的关联信息（歌单、评论）发生重大变化时，可重新提取特征：
+
+```
+歌单变更（歌曲被加入新歌单）→ 标记需要重新提取 → 下次批量处理时更新
+```
+
+**特征更新策略**：
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| **覆盖更新** | 重新提取并覆盖原有特征 | 歌曲信息发生重大变化 |
+| **追加更新** | 新增标签追加到现有标签 | 歌曲被加入新歌单（保留原有标签，新增歌单语义） |
 
 ---
 
@@ -408,7 +539,7 @@ playback_completion_rate = (playback_duration_seconds / song_duration_seconds) *
 | **运维成本** | ⭐⭐ 低 | ⭐⭐⭐⭐ 高 |
 | **适用规模** | 百万级向量 | 千万级以上 |
 
-**本项目建议：PostgreSQL + pgvector（可选）**
+**本项目建议：PostgreSQL + pgvector（初版）→ 专用向量数据库（扩展）**
 
 理由：
 1. **初版规模预估**：假设曲库10万首歌曲，向量维度1536
@@ -422,7 +553,36 @@ playback_completion_rate = (playback_duration_seconds / song_duration_seconds) *
 
 3. **运维简化**：与现有 PostgreSQL 统一管理，降低复杂度
 
-4. **扩展路径**：如果未来曲库规模超过500万首，再考虑迁移到专用向量数据库
+4. **扩展路径**（预留）：
+   - 如果未来曲库规模超过500万首，或需要更高的召回精度
+   - 可平滑迁移到专用向量数据库（如 Qdrant、Milvus）
+   - 迁移时只需将 `feature_vector` 数据导出，再导入到新数据库
+
+**扩展为专用向量数据库的判断条件：**
+
+| 判断条件 | 操作 |
+|----------|------|
+| 曲库规模 > 500万首 | 考虑迁移到 Qdrant/Milvus |
+| 向量检索延迟 > 200ms | 升级到专用向量库 |
+| 需要更复杂的向量检索（如混合检索） | 升级到专用向量库 |
+| 团队有余力维护独立服务 | 可提前升级 |
+
+**扩展时的数据迁移脚本（预留）：**
+
+```python
+# 迁移脚本伪代码
+def migrate_to_qdrant():
+    # 1. 从 PostgreSQL 导出向量数据
+    vectors = db.query("SELECT song_id, feature_vector FROM music_features WHERE feature_vector IS NOT NULL")
+
+    # 2. 写入 Qdrant
+    qdrant.upsert_batch(collection_name="music_features", vectors=vectors)
+
+    # 3. 修改代码中的向量检索逻辑
+    # vector_db = QdrantVectorDB()  # 替换 pgvector
+```
+
+---
 
 **pgvector 配置示例：**
 
@@ -511,10 +671,70 @@ ON music_features USING ivfflat (feature_vector vector_cosine_ops);
    - 按月分区，每年新增约 50GB
    - 配合索引，查询性能可接受
 
-2. **PostgreSQL 分区表设计：**
+**本项目建议：方案C - PostgreSQL 分区表（初版）→ 方案A MongoDB（扩展）**
+
+**理由**：
+
+1. **初版规模（<100万用户）**：
+   - PostgreSQL 分区表完全可应对
+   - 按月分区，每年新增约 50GB
+   - 配合索引，查询性能可接受
+
+---
+
+##### 3.3.2.1 PostgreSQL 分区表详解
+
+**什么是分区表？**
+
+分区表是一种将大表拆分为多个小子表（分区）的技术，对用户来说是透明的（查询时不需要关心数据在哪个分区），但底层是多个物理表。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              逻辑表：recommendation_feedback                    │
+│   （用户看到的是一张表，但实际上分成了多个物理分区）              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐│
+│  │ feedback_2025_01 │  │ feedback_2025_02 │  │ feedback_2025_03 ││
+│  │  (1月数据)        │  │  (2月数据)        │  │  (3月数据)       ││
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘│
+│         │                    │                    │               │
+│         └────────────────────┴────────────────────┘               │
+│                            │                                     │
+│                     同一张逻辑表                                   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**分区表 vs 普通表的区别**：
+
+| 特性 | 普通表 | 分区表 |
+|------|--------|--------|
+| **数据存储** | 单个大表 | 多个小分区 |
+| **INSERT 行为** | 直接插入 | 根据时间自动路由到对应分区 |
+| **查询行为** | 全表扫描 | 可裁剪（只扫描相关分区） |
+| **DELETE 行为** | 逐行删除 | 直接删除整个分区（极快） |
+| **维护** | VACUUM 整个表 | 可单独维护某个分区 |
+| **索引** | 全局索引 | 可创建分区级索引 |
+
+**为什么推荐历史与反馈表需要分区？？**
+
+因为 feedback 表数据量增长极快（每年约 2.7 亿条），如果用普通表：
+- 单表超过亿级后，查询和写入性能都会明显下降
+- 删除旧数据（如清理1年前的数据）需要执行 `DELETE`，很慢且产生碎片
+- 索引会变大变慢
+
+使用分区表后：
+- 查询 `2025年1月` 的数据时，PostgreSQL 自动只扫描 `feedback_2025_01` 分区
+- 删除1年前的数据，只需要 `DROP TABLE feedback_2024_01`（瞬间完成）
+- 每个分区可以独立 `VACUUM`、`ANALYZE`
+
+---
+
+##### 3.3.2.2 分区表设计 DDL
 
 ```sql
--- 创建分区表（按月分区）
+-- 创建分区表（按月分区，以 action_timestamp 为分区键）
 CREATE TABLE recommendation_feedback (
     id SERIAL,
     history_id INTEGER,
@@ -532,22 +752,30 @@ CREATE TABLE recommendation_feedback (
     PRIMARY KEY (id, action_timestamp)
 ) PARTITION BY RANGE (action_timestamp);
 
--- 创建月度分区
+-- 创建月度分区（初版先创建当年12个月的分区）
 CREATE TABLE recommendation_feedback_2025_01 PARTITION OF recommendation_feedback
     FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
 CREATE TABLE recommendation_feedback_2025_02 PARTITION OF recommendation_feedback
     FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
--- ... 以此类推
+CREATE TABLE recommendation_feedback_2025_03 PARTITION OF recommendation_feedback
+    FOR VALUES FROM ('2025-03-01') TO ('2025-04-01');
+-- ... 创建 2025_04 到 2025_12 的分区
 
--- 自动创建未来分区的函数
+-- 创建分区索引（每个分区独立索引，更高效）
+CREATE INDEX idx_feedback_history_2025_01 ON recommendation_feedback_2025_01(history_id);
+CREATE INDEX idx_feedback_song_2025_01 ON recommendation_feedback_2025_01(song_id);
+
+-- 自动创建未来分区的函数（可加入 cron 定时任务）
 CREATE OR REPLACE FUNCTION create_monthly_partition()
 RETURNS void AS $$
 DECLARE
     next_month DATE;
     partition_name TEXT;
 BEGIN
+    -- 创建下个月的分区
     next_month := date_trunc('month', CURRENT_DATE + INTERVAL '1 month');
     partition_name := 'recommendation_feedback_' || to_char(next_month, 'YYYY_MM');
+
     EXECUTE format(
         'CREATE TABLE IF NOT EXISTS %I PARTITION OF recommendation_feedback
          FOR VALUES FROM (%L) TO (%L)',
@@ -555,29 +783,77 @@ BEGIN
         next_month,
         next_month + INTERVAL '1 month'
     );
+EXCEPTION WHEN duplicate_table THEN
+    RAISE NOTICE 'Partition % already exists', partition_name;
 END;
 $$ LANGUAGE plpgsql;
 ```
 
-3. **历史数据归档策略：**
+---
+
+##### 3.3.2.3 历史数据归档策略
+
+**数据生命周期管理（三层架构）**：
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                      数据生命周期管理                             │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│   热数据（< 3个月）    │   温数据（3-12个月）   │   冷数据（> 1年） │
-│   ─────────────────   │   ─────────────────   │   ─────────────  │
-│   PostgreSQL 主表     │   PostgreSQL 分区     │   归档到对象存储   │
-│   全量索引，高可用     │   减少索引，定期压缩    │   (S3/OSS)       │
+│  热数据（< 3个月）  │   温数据（3-12个月）  │   冷数据（> 1年）  │
+│  ─────────────────  │   ─────────────────  │   ─────────────   │
+│  PostgreSQL        │   PostgreSQL        │   对象存储         │
+│  分区表（活跃）     │   分区表（压缩）      │   (S3/OSS)        │
 │                                                                  │
-│   用于实时推荐         │   用于分析统计         │   用于模型训练    │
-│   快速查询            │   趋势分析             │   历史样本        │
+│  • 全量索引         │   • 稀疏索引          │   • 仅存档        │
+│  • 高性能SSD       │   • 定期 VACUUM       │   • 模型训练用    │
+│  • 实时查询        │   • 月度统计          │   • 历史分析      │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-4. **扩展路径**：当数据量超过 1 亿条或查询延迟明显上升时，再迁移到 MongoDB
+**说明**：
+
+- **分区表**：解决的是"如何高效管理热数据和温数据"（< 12个月的数据）
+- **S3归档**：解决的是"超过1年的冷数据如何处理"（降低存储成本）
+
+这两个策略是互补的，不是冲突的：
+1. **3个月内**：数据在分区中，全量索引，实时查询
+2. **3-12个月**：数据仍在分区中，减少索引，定期压缩
+3. **超过12个月**：从分区中分离（DETACH），导出为 CSV 上传到 S3，然后删除旧分区
+
+**S3归档的具体步骤**：
+
+```python
+# 归档流程伪代码
+def archive_old_partition(year_month: str):
+    partition_name = f'recommendation_feedback_{year_month}'
+
+    # 1. 导出数据为 CSV
+    with open(f'{partition_name}.csv', 'w') as f:
+        for row in db.query(f'SELECT * FROM {partition_name}'):
+            f.write(','.join(str(x) for x in row) + '\n')
+
+    # 2. 上传到 S3
+    s3.upload_file(f'{partition_name}.csv', f'music-recommend/archive/{partition_name}.csv')
+
+    # 3. 从分区表中分离并删除（旧分区已无用）
+    db.execute(f'ALTER TABLE recommendation_feedback DETACH PARTITION {partition_name}')
+    db.execute(f'DROP TABLE {partition_name}')
+
+    # 4. 记录归档元数据
+    archive_metadata.add(partition_name, 's3', year_month)
+```
+
+**判断是否需要归档**：
+
+| 判断条件 | 操作 |
+|----------|------|
+| 数据超过 12 个月 | 归档到 S3 |
+| 分区表占用空间 > 100GB | 考虑提前归档 |
+| 需要节省存储成本 | 归档低访问分区 |
+
+---
 
 **MongoDB 迁移方案（预留）：**
 
@@ -666,15 +942,121 @@ Request:
 
 ---
 
+### 4.3 后端文件变更清单
+
+由于新增了 API 端点，后端需要创建或修改以下文件：
+
+#### 4.3.1 新增文件
+
+| 文件路径 | 说明 | 依赖 |
+|----------|------|------|
+| `backend/services/llm_service.py` | MiniMax API 封装（LLM调用） | minimax SDK |
+| `backend/services/feature_service.py` | 歌曲特征提取服务 | llm_service.py |
+| `backend/services/recommend_service.py` | 推荐核心逻辑服务 | llm_service.py, feature_service.py |
+| `backend/routes/recommend.py` | 推荐相关 API 路由 | recommend_service.py |
+| `backend/models/database.py` | 数据库连接管理模块 | psycopg2 |
+| `backend/utils/__init__.py` | 工具模块初始化 | - |
+
+#### 4.3.2 修改文件
+
+| 文件路径 | 修改内容 | 说明 |
+|----------|----------|------|
+| `backend/app.py` | 注册 `recommend_bp` Blueprint | 在 `create_app()` 中添加 |
+| `backend/config.py` | 新增配置项（LLM、MiniMax等） | 参考 8.配置文件更新 |
+| `backend/.env` | 新增环境变量 | MiniMax API Key 等 |
+| `backend/requirements.txt` | 新增依赖 | minimax-api、psycopg2-binary 等 |
+
+#### 4.3.3 文件目录结构
+
+```
+backend/
+├── app.py                          # [修改] 注册 Blueprint
+├── config.py                       # [修改] 新增推荐相关配置
+├── requirements.txt                 # [修改] 新增依赖
+├── .env                             # [修改] 新增环境变量
+├── services/
+│   ├── __init__.py
+│   ├── llm_service.py              # [新增] LLM 服务封装
+│   ├── feature_service.py          # [新增] 歌曲特征服务
+│   └── recommend_service.py        # [新增] 推荐核心服务
+├── routes/
+│   ├── __init__.py
+│   └── recommend.py                 # [新增] 推荐 API 路由
+├── models/
+│   ├── __init__.py
+│   └── database.py                 # [新增] 数据库连接模块
+└── utils/
+    └── __init__.py                  # [新增] 工具模块
+```
+
+#### 4.3.4 各文件职责说明
+
+| 文件 | 职责 |
+|------|------|
+| `llm_service.py` | 封装 MiniMax API，提供 chat 和 embedding 方法 |
+| `feature_service.py` | 管理歌曲特征生成，支持批量处理和定时任务 |
+| `recommend_service.py` | 实现推荐算法，调用 LLM 进行语义匹配 |
+| `routes/recommend.py` | 定义 REST API 端点，处理 HTTP 请求/响应 |
+| `models/database.py` | 管理 PostgreSQL 连接，提供统一的数据库访问接口 |
+| `app.py` | 应用入口，注册 Blueprint，挂载路由 |
+| `config.py` | 配置管理，集中管理所有配置项 |
+
+---
+
 ## 5. 前端集成设计
 
-### 5.1 新增页面/组件
+### 5.1 新增组件（而非页面）
 
-| 组件 | 路径 | 说明 |
-|------|------|------|
-| 推荐页面 | `/pages/recommend/recommend.vue` | 文本输入和结果展示 |
-| 推荐结果卡片 | `/components/RecommendCard.vue` | 单个推荐结果展示+反馈按钮 |
-| 首页入口 | `/pages/index/index.vue` | 添加"AI推荐"入口按钮 |
+根据原前端项目风格（使用组件而非独立页面），本次新增内容如下：
+
+| 组件 | 文件路径 | 说明 |
+|------|----------|------|
+| 推荐卡片组件 | `/components/RecommendCard.vue` | 展示单条推荐结果+反馈按钮 |
+| 首页AI入口 | `/components/AIRecommendEntry.vue` | 首页的AI推荐入口按钮 |
+| API封装 | `/api/recommend.js` | 推荐相关 API 调用封装 |
+
+**为什么不新增独立页面？**
+
+原前端项目（uniapp）中，AI 推荐功能可以作为首页的一个入口，点击后通过 `uni.navigateTo` 跳转到播放器页面，或者直接在当前页面以弹窗/抽屉形式展示推荐结果。这样更符合轻量化的设计理念。
+
+**组件使用方式示例**：
+
+```vue
+<!-- 首页 index.vue 中使用 -->
+<template>
+  <view class="index-page">
+    <!-- AI 推荐入口 -->
+    <AIRecommendEntry @click="showRecommendModal" />
+
+    <!-- 推荐弹窗 -->
+    <RecommendModal
+      v-model="showRecommend"
+      :history-id="historyId"
+    />
+  </view>
+</template>
+
+<script>
+import AIRecommendEntry from '@/components/AIRecommendEntry.vue'
+import RecommendModal from '@/components/RecommendModal.vue'
+
+export default {
+  components: {
+    AIRecommendEntry,
+    RecommendModal
+  }
+}
+</script>
+```
+
+**组件设计说明**：
+
+| 组件 | 功能 | 使用场景 |
+|------|------|----------|
+| `AIRecommendEntry` | AI推荐入口按钮，点击触发推荐 | 首页 |
+| `RecommendCard` | 单条推荐结果展示（歌曲信息+匹配理由+反馈按钮） | 推荐结果列表 |
+| `RecommendModal` | 推荐弹窗（输入框+结果展示+播放） | 全局 |
+| `RecommendResults` | 推荐结果列表容器 | 推荐弹窗内 |
 
 ### 5.2 语音输入设计
 
@@ -740,23 +1122,69 @@ Request:
    from minimax import MiniMax
 
    client = MiniMax(api_key="your_key")
-   # 测试 chat API
+   # 测试 chat API（使用您指定的 MiniMax-2.7 模型）
    response = client.chat.completions.create(
-       model="abab6.5s-chat",
+       model="MiniMax-2.7",  # 或 "abab6.5s-chat"
        messages=[{"role": "user", "content": "你好"}]
    )
    print(response.choices[0].message.content)
    ```
 
-3. 确认 embedding API 可用：
+3. **确认 embedding 模型**：
+
+   MiniMax 的 embedding 模型名称需要查证，建议方案如下：
+
+   **方案A（推荐）：使用本地 Embedding 模型**
+
+   使用开源的 sentence-transformers 模型，不依赖外部 API：
    ```python
-   # 测试 embedding
+   from sentence_transformers import SentenceTransformer
+
+   # 中文嵌入模型（推荐）
+   model = SentenceTransformer('BAAI/bge-base-zh-v1.5')
+
+   # 或多语言模型
+   model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+
+   # 生成向量
+   embedding = model.encode("测试文本")
+   ```
+
+   **方案B：使用 MiniMax Embedding API**（待查证）
+
+   如果 MiniMax 提供 embedding API，可使用：
+   ```python
+   # 注意：embo-01 需要确认是否可用
    embedding = client.embeddings.create(
-       model="embo-01",
+       model="embo-01",  # 待查证
        input="测试文本"
    )
    print(len(embedding.data[0].embedding))
    ```
+
+   **关于 MiniMax Embedding 模型**：MiniMax 官方支持的 embedding 模型名称需要参考官方文档。当前设计预留了两种方案，如果 MiniMax-2.7 配套有 `embedding-2.7` 或类似模型，建议使用；否则推荐使用本地模型（如 BAAI/bge 系列）。
+
+**MiniMax Embedding 模型查证清单**：
+
+| 模型名称 | 说明 | 状态 |
+|----------|------|------|
+| `embo-01` | 旧版模型名称 | 待确认 |
+| `embedding-2.7` | 与 LLM 配套 | 待查证 |
+| `BAAI/bge-base-zh-v1.5` | 本地开源模型 | 确认可用 |
+
+**配置建议**：
+
+```python
+# backend/config.py
+
+# 方案A：使用本地模型（推荐，初版使用）
+EMBEDDING_MODEL = 'BAAI/bge-base-zh-v1.5'
+EMBEDDING_DIMENSION = 768  # bge-base-zh-v1.5 的维度
+
+# 方案B：使用 MiniMax API（如果可用）
+# MINIMAX_EMBEDDING_MODEL = 'embo-01'
+# EMBEDDING_DIMENSION = 1536
+```
 
 #### 6.1.3 前端环境检查
 
