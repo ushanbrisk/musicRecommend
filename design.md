@@ -240,47 +240,154 @@ CREATE INDEX idx_music_features_song_id ON music_features(song_id);
 
 ---
 
-### 3.2 新增表：推荐历史与反馈 (recommendation_history)
+### 3.2 新增表：推荐历史与反馈 (recommendation_history & recommendation_feedback)
 
-记录用户的推荐查询和反馈，支持正负反馈用于优化推荐算法。
+#### 设计理念
+
+用户的主动行为是推荐系统的灵魂。通过记录用户在获取推荐后的真实互动（播放、跳过、完成度等），系统能够持续学习用户偏好，迭代优化推荐算法。这些数据使得推荐从"一次性的静态匹配"演变为"持续优化的动态反馈系统"。
+
+#### 3.2.1 推荐历史表 (recommendation_history)
+
+记录用户每次主动查询的内容及返回结果。
 
 ```sql
 CREATE TABLE recommendation_history (
     id SERIAL PRIMARY KEY,
     session_id VARCHAR(100),         -- 会话标识（可跨查询关联同一用户）
-    query_text TEXT NOT NULL,        -- 用户输入的查询文本
-    query_type VARCHAR(50),          -- simple/complex/poem/voice
+    user_id VARCHAR(100),            -- 用户标识（可选，若已登录）
+
+    -- 用户输入的查询内容
+    query_text TEXT NOT NULL,        -- 用户输入的原始查询文本
+    query_type VARCHAR(50),          -- 查询类型：simple/complex/poem/voice
+    query_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- 查询时间
+
+    -- 返回结果信息
     result_count INTEGER,            -- 返回结果数量
-    latency_ms INTEGER,             -- 响应时间（毫秒）
+    result_song_ids BIGINT[],        -- 返回的歌曲ID列表（方便后续关联行为）
+    latency_ms INTEGER,              -- 响应时间（毫秒）
+
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- 推荐反馈表（支持正负反馈，类似抖音）
+-- 索引设计
+CREATE INDEX idx_history_session ON recommendation_history(session_id);
+CREATE INDEX idx_history_user ON recommendation_history(user_id);
+CREATE INDEX idx_history_query_time ON recommendation_history(query_timestamp);
+```
+
+**字段说明：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `session_id` | VARCHAR(100) | 匿名会话ID，用于关联同一用户的多次查询 |
+| `user_id` | VARCHAR(100) | 登录用户ID（可选），登录后关联行为 |
+| `query_text` | TEXT | 用户输入的原始查询，如"欢快的凯尔特音乐" |
+| `query_type` | VARCHAR(50) | 查询类型：simple(简单场景)/complex(复杂描述)/poem(古诗词)/voice(语音) |
+| `query_timestamp` | TIMESTAMP | 查询发生的时间 |
+| `result_count` | INTEGER | 返回的结果数量 |
+| `result_song_ids` | BIGINT[] | 返回的歌曲ID数组，便于后续关联播放行为 |
+| `latency_ms` | INTEGER | 此次请求的响应时间 |
+
+---
+
+#### 3.2.2 推荐反馈表 (recommendation_feedback)
+
+记录用户对推荐结果的后续行为，包括播放完成度、是否跳过等核心指标。
+
+```sql
 CREATE TABLE recommendation_feedback (
     id SERIAL PRIMARY KEY,
     history_id INTEGER REFERENCES recommendation_history(id) ON DELETE CASCADE,
     song_id BIGINT NOT NULL,         -- 被反馈的歌曲
-    feedback_type VARCHAR(20) NOT NULL,  -- like(喜欢)/dislike(不喜欢)/skip(划走)
-    feedback_detail VARCHAR(100),   -- 详细反馈：too_sad/too_happy/not_match等
+
+    -- 播放行为追踪（核心字段）
+    playback_duration_seconds INTEGER,           -- 实际播放时长（秒）
+    song_duration_seconds INTEGER,               -- 歌曲总时长（秒）
+    playback_completion_rate DECIMAL(5,2),        -- 播放完成度百分比（0-100），计算得出
+    skipped BOOLEAN DEFAULT FALSE,                -- 是否点击了"下一首"跳过（TRUE=跳过）
+    looped BOOLEAN DEFAULT FALSE,                 -- 是否点击了循环播放（TRUE=循环）
+
+    -- 主动反馈（用户显式操作）
+    feedback_type VARCHAR(20),                   -- 显式反馈：like/dislike/null
+    feedback_detail VARCHAR(100),               -- 详细反馈：too_sad/too_happy/not_match等
+
+    -- 行为元数据
+    action_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- 行为发生时间
+    play_source VARCHAR(50),                     -- 播放来源：recommend/playlist/search/history
+
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-    -- 同一用户对同一歌曲在同一查询中只记录一条反馈
+    -- 约束：同一查询中的同一歌曲只记录一条行为
     UNIQUE(history_id, song_id)
 );
 
--- 索引
+-- 索引设计
 CREATE INDEX idx_feedback_history ON recommendation_feedback(history_id);
 CREATE INDEX idx_feedback_song ON recommendation_feedback(song_id);
 CREATE INDEX idx_feedback_type ON recommendation_feedback(feedback_type);
+CREATE INDEX idx_feedback_skipped ON recommendation_feedback(skipped);
+CREATE INDEX idx_feedback_completion ON recommendation_feedback(playback_completion_rate);
 ```
 
-**反馈类型说明：**
+**核心字段设计说明：**
 
-| feedback_type | 含义 | 使用场景 |
-|---------------|------|----------|
-| `like` | 喜欢/感兴趣 | 正样本，强化推荐 |
-| `dislike` | 不喜欢 | 负样本，减少推荐 |
-| `skip` | 划走/不感兴趣 | 弱负样本，降低权重 |
+| 字段 | 类型 | 说明 | 数据来源 |
+|------|------|------|----------|
+| `playback_duration_seconds` | INTEGER | 用户实际播放的秒数 | 前端播放器上报 |
+| `song_duration_seconds` | INTEGER | 歌曲本身的时长 | 歌曲元数据 |
+| `playback_completion_rate` | DECIMAL(5,2) | 播放完成度：`playback_duration / song_duration * 100` | 计算字段 |
+| `skipped` | BOOLEAN | 用户是否主动点击"下一首"跳过 | 前端播放器上报 |
+| `looped` | BOOLEAN | 用户是否点击循环播放 | 前端播放器上报 |
+
+**行为信号分析：**
+
+| 用户行为 | 信号强度 | 推荐算法意义 |
+|----------|----------|--------------|
+| 播放完成度 > 80% | ⭐⭐⭐⭐⭐ | 强烈正向信号，用户完整听完 |
+| 播放完成度 50%-80% | ⭐⭐⭐⭐ | 正向信号，用户比较喜欢 |
+| 播放完成度 30%-50% | ⭐⭐ | 弱信号，可能不太感兴趣 |
+| 播放完成度 < 30% | ⭐ | 负向信号，用户很快跳过 |
+| `skipped = TRUE` | ⭐ | 明确负向信号，主动跳过 |
+| `looped = TRUE` | ⭐⭐⭐⭐⭐ | 强烈正向信号，循环播放 |
+
+**播放完成度计算公式：**
+
+```
+playback_completion_rate = (playback_duration_seconds / song_duration_seconds) * 100
+```
+
+> **设计思考**：为什么用播放完成度而不是播放时长？
+> - 歌曲时长差异很大（3分钟 vs 10分钟），单纯时长不具可比性
+> - 完成度标准化了这一差异，更准确反映用户意愿
+> - 结合 `skipped` 字段可以交叉验证：完成度50%左右且skipped=TRUE，说明用户主动跳过
+
+**数据上报时机：**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        用户行为上报流程                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. 用户点击推荐结果中的歌曲 → 开始播放                          │
+│         │                                                        │
+│         ▼                                                        │
+│  2. 播放器定时上报播放进度（每30秒或歌曲切换时）                  │
+│         │                                                        │
+│         ▼                                                        │
+│  3. 歌曲播放结束/用户跳过 → 上报最终行为数据                      │
+│         │                                                        │
+│         ▼                                                        │
+│  4. 后端记录 feedback 表                                         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**未来扩展方向（初版暂不实现）：**
+
+- 用户收藏/加入歌单行为
+- 用户分享行为
+- 用户评论行为
+- 同一会话内的多轮交互（类似对话式推荐）
 
 ---
 
@@ -388,6 +495,143 @@ Request:
 ---
 
 ## 7. 技术选型
+
+### 7.1 LLM 与 Agent 方案对比分析
+
+在设计智能音乐推荐系统时，面临一个关键决策：使用纯大模型（LLM）还是基于大模型的 Agent（智能体）？以下是两种方案的详细对比：
+
+#### 方案A：纯大模型（LLM）
+
+**架构特点：**
+- 单次请求-响应模式
+- 用户输入 → LLM推理 → 返回结果
+- 无状态，每次交互独立
+
+**优缺点：**
+
+| 优点 | 缺点 |
+|------|------|
+| 实现简单，延迟低 | 无法进行多轮对话式推荐 |
+| 成本可控 | 无法自主规划查询策略 |
+| 易于部署和监控 | 无法处理复杂决策流程 |
+| 适合一次性精准匹配 | 缺乏自我纠错能力 |
+
+**适用场景：**
+- 查询语义理解和意图识别
+- 歌曲特征提取和标签生成
+- 单次推荐匹配（输入 → 输出）
+
+---
+
+#### 方案B：大模型 Agent（智能体）
+
+**架构特点：**
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Agent 架构                              │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌─────────────┐                                             │
+│  │   用户输入   │                                             │
+│  └──────┬──────┘                                             │
+│         │                                                    │
+│         ▼                                                    │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐       │
+│  │   Planning  │───▶│   Action   │───▶│   Observe   │       │
+│  │   (规划)    │    │   (执行)   │    │   (观察)   │       │
+│  └─────────────┘    └─────────────┘    └──────┬──────┘       │
+│         ▲                                       │            │
+│         │          ┌─────────────┐              │            │
+│         └──────────│   Loop ◯   │◀─────────────┘            │
+│                    │   (循环)   │                           │
+│                    └─────────────┘                           │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**核心能力：**
+
+| 能力 | 说明 |
+|------|------|
+| **循环（Loop）** | Agent可以多次执行"思考→行动→观察"循环，直到达到目标 |
+| **工具调用（Tool Use）** | 可调用外部工具（搜索、数据库查询、API调用） |
+| **自我反思（Reflection）** | 可根据中间结果调整策略 |
+| **多轮交互（Multi-turn）** | 可与用户进行对话式澄清 |
+
+**优缺点：**
+
+| 优点 | 缺点 |
+|------|------|
+| 支持多轮对话，精准澄清用户意图 | 实现复杂度高 |
+| 可自主规划搜索策略 | 延迟可能较高 |
+| 支持复杂决策流程 | 成本更高（多次调用） |
+| 可进行自我纠错 | 调试和监控困难 |
+
+---
+
+#### 本项目方案建议：**混合方案（推荐）**
+
+**理由：**
+
+1. **核心推荐用 LLM**：音乐推荐的核心是"语义匹配"，单次LLM调用即可完成：
+   - 用户查询理解 → 生成筛选条件
+   - 数据库匹配 → 返回结果
+   - 这是强确定性任务，LLM足够
+
+2. **复杂场景用 Agent**：在以下场景 Agent 更有价值：
+   - 用户说"刚才那首不错，来点类似的" → 多轮上下文理解
+   - 用户意图模糊，需要主动询问澄清 → 对话式交互
+   - 推荐结果不满意，需要重新规划搜索策略 → 自我纠错
+
+3. **成本与效率考量**：
+   - 80%的查询是简单场景，LLM单次调用即可
+   - 20%的复杂场景才需要 Agent
+   - 避免为简单任务支付 Agent 的额外开销
+
+**混合架构设计：**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        用户查询                                   │
+└──────────────────────────┬────────────────────────────────────────┘
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │    意图分类器 (LLM)     │
+              │  simple → LLM 直接匹配  │
+              │  complex → Agent 处理  │
+              └────────────┬───────────┘
+                           │
+           ┌───────────────┴───────────────┐
+           ▼                               ▼
+┌─────────────────────┐         ┌─────────────────────┐
+│    LLM 快速路径      │         │   Agent 复杂路径      │
+│  (单次调用完成)      │         │  (多轮循环处理)       │
+│                     │         │                      │
+│  • 查询语义理解      │         │  • 规划搜索策略       │
+│  • 生成筛选条件      │         │  • 调用多个工具       │
+│  • 返回推荐结果      │         │  • 自我反思纠错       │
+│                     │         │  • 返回推荐结果       │
+└─────────────────────┘         └─────────────────────┘
+```
+
+**初版实现建议：**
+
+| 阶段 | 实现方案 | 说明 |
+|------|----------|------|
+| **初版（推荐）** | 纯 LLM | 先实现核心功能，验证推荐效果 |
+| **后续迭代** | 混合方案 | 根据实际需求，复杂场景引入 Agent |
+| **预留接口** | Agent 接口设计 | 保持架构扩展性，Agent 可独立迭代 |
+
+> **最终建议**：初版使用**纯 LLM 方案**，原因：
+> 1. 实现简单，能快速验证推荐效果
+> 2. 成本可控，易于监控和优化
+> 3. Agent 可作为后续迭代方向，不影响核心功能
+> 4. 本项目的推荐逻辑（语义匹配）不需要循环和多轮交互也能完成
+
+---
+
+### 7.2 技术组件选型
 
 | 组件 | 选择 | 理由 |
 |------|------|------|
