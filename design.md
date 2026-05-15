@@ -965,8 +965,10 @@ Request:
 |----------|----------|------|
 | `backend/app.py` | 注册 `recommend_bp` Blueprint | 在 `create_app()` 中添加 |
 | `backend/config.py` | 新增配置项（LLM、MiniMax等） | 参考 8.配置文件更新 |
-| `backend/.env` | 新增环境变量 | MiniMax API Key 等 |
-| `backend/requirements.txt` | 新增依赖 | minimax-api、psycopg2-binary 等 |
+| `backend/.env` | 新增环境变量 | MiniMax API Key、推荐相关配置 |
+| `backend/requirements.txt` | 新增依赖 | minimax-api |
+
+> **注**：其他依赖（flask、psycopg2-binary、pymongo、python-dotenv）已在现有 requirements.txt 中，无需重复安装。
 
 #### 4.3.3 文件目录结构
 
@@ -1095,24 +1097,26 @@ export default {
 
 **目标**：确认后端项目结构和依赖
 
+> **重要**：后端项目使用 conda 环境运行，路径为 `$HOME/miniconda3/envs/music/bin/python`。后续所有 Python 包安装（包括 pip install）必须使用该环境的 Python，以确保包被安装到正确的位置。
+
 **执行步骤**：
 
 1. **检查现有项目结构**
    ```bash
-   cd /path/to/music-project/backend
+   cd ~/code_project/music-project/backend
    ls -la
    # 确认存在: app.py, requirements.txt, .env 等文件
    ```
 
 2. **检查 Python 版本和依赖**
    ```bash
-   python3 --version  # 需 >= 3.9
-   pip3 list | grep -E "Flask|psycopg2|pymongo"
+   ~/miniconda3/envs/music/bin/python --version  # 需 >= 3.9
+   ~/miniconda3/envs/music/bin/pip list | grep -E "Flask|psycopg2|pymongo"
    ```
 
-3. **安装必要依赖**
+3. **安装必要依赖**（必须在 conda 环境中）
    ```bash
-   pip3 install flask psycopg2-binary pymongo redis minimax-api python-dotenv
+   ~/miniconda3/envs/music/bin/pip install flask psycopg2-binary pymongo redis minimax-api python-dotenv
    ```
 
 4. **配置 .env 文件**（参考 8.配置文件更新）
@@ -1214,9 +1218,18 @@ EMBEDDING_DIMENSION = 768  # bge-base-zh-v1.5 的维度
 
 3. **安装项目依赖**
    ```bash
-   cd /path/to/music-project-uniapp
+   cd ~/code_project/music-project-uniapp
    npm install
    ```
+
+**阶段一测试措施**：
+
+| 测试项 | 验证方法 | 预期结果 |
+|--------|----------|----------|
+| 后端服务启动 | `~/miniconda3/envs/music/bin/python app.py` | 服务启动在 5000 端口 |
+| 数据库连接 | 访问 `GET /api/songs` | 返回歌曲列表（非空） |
+| 前端服务启动 | `npm run dev` | H5 服务启动在 8080 端口 |
+| MiniMax API | 编写测试脚本调用 chat 接口 | 返回正常的对话结果 |
 
 ---
 
@@ -1341,6 +1354,16 @@ use music_comments
 db.comments.createIndex({ "song_id": 1 })
 db.comments.createIndex({ "sentiment": 1, "polarity": 1 })
 ```
+
+**阶段二测试措施**：
+
+| 测试项 | 验证方法 | 预期结果 |
+|--------|----------|----------|
+| music_features 表 | `SELECT COUNT(*) FROM music_features LIMIT 1` | 查询成功，表存在 |
+| recommendation_history 表 | `SELECT COUNT(*) FROM recommendation_history LIMIT 1` | 查询成功，表存在 |
+| recommendation_feedback 表 | `SELECT COUNT(*) FROM recommendation_feedback LIMIT 1` | 查询成功，表存在 |
+| MongoDB 索引 | `db.comments.getIndexes()` | 存在 song_id 和 sentiment 索引 |
+| 关联查询 | 运行 design.md 1.2.3.2 中的核心关联查询 | 返回预期的查询结果 |
 
 ---
 
@@ -1575,6 +1598,39 @@ class FeatureService:
 
 **目标**：创建 `backend/services/recommend_service.py`，实现推荐算法
 
+**推荐算法设计说明（初版纯 LLM 方案）**：
+
+> **为什么不使用 Embedding/向量检索？**
+>
+> 初版采用**纯文本语义匹配**方案，不依赖 Embedding 模型，流程如下：
+>
+> 1. **获取候选歌曲**：从 `music_features` 表随机采样约 500 首候选歌曲
+> 2. **构建上下文字符串**：将候选歌曲的文本特征（名称、艺术家、风格、情绪、场景）拼接为一段文本
+> 3. **LLM 直接匹配**：将用户查询和候选歌曲文本一起发送给 LLM，让 LLM 直接输出匹配的歌曲
+>
+> ```
+> 用户: "欢快的凯尔特音乐"
+>        │
+>        ▼
+> 候选歌曲文本（最多100首）:
+> "song_id: 123, 名称: X, 风格: 古典, 情绪: 欢快, 场景: 夜晚"
+> "song_id: 456, 名称: Y, 风格: 凯尔特, 情绪: 欢快, 场景: 聚会"
+>        │
+>        ▼
+> LLM 返回匹配结果（JSON）
+> ```
+>
+> **优点**：
+> - 无需 Embedding 模型，成本低
+> - 实现简单，快速验证
+> - LLM 具备语义理解能力，可处理复杂查询
+>
+> **限制**：
+> - 受限于 LLM 上下文窗口，每次最多处理约 100 首歌曲
+> - 曲库规模大时无法遍历全部歌曲
+>
+> **扩展方向**：当曲库规模超过 10 万首或需要更高召回率时，可升级为**向量检索方案**（使用 Embedding 模型 + pgvector），详见 3.3.1 节。
+
 **recommend_service.py 实现要点**：
 ```python
 # backend/services/recommend_service.py
@@ -1642,6 +1698,8 @@ class RecommendService:
     def get_candidates(self, query_type: str, limit: int = 500) -> List[Dict]:
         """获取候选歌曲"""
         # 从 music_features 表获取候选
+        # 注意：随机采样约 500 首，但 build_songs_context 只会使用前 100 首
+        # 这是因为 LLM 上下文窗口有限，无法处理过多歌曲
         query = """
             SELECT mf.*, s.song_name, s.artist, s.album, s.music_file
             FROM music_features mf
@@ -1914,6 +1972,16 @@ def get_db_cursor():
         conn.close()
 ```
 
+**阶段三测试措施**：
+
+| 测试项 | 验证方法 | 预期结果 |
+|--------|----------|----------|
+| LLMService 导入 | `~/miniconda3/envs/music/bin/python -c "from services.llm_service import LLMService; print('OK')"` | 输出 OK，无报错 |
+| FeatureService 导入 | `~/miniconda3/envs/music/bin/python -c "from services.feature_service import FeatureService; print('OK')"` | 输出 OK，无报错 |
+| RecommendService 导入 | `~/miniconda3/envs/music/bin/python -c "from services.recommend_service import RecommendService; print('OK')"` | 输出 OK，无报错 |
+| recommend_bp 导入 | `~/miniconda3/envs/music/bin/python -c "from routes.recommend import recommend_bp; print('OK')"` | 输出 OK，无报错 |
+| 模块依赖链 | 创建测试脚本实例化 RecommendService | 无 ImportError |
+
 ---
 
 ### 6.4 阶段四：后端 API 集成与注册（预计工作量：0.5天）
@@ -1947,17 +2015,32 @@ if __name__ == '__main__':
 
 ```bash
 # 启动后端服务
-cd backend
-python app.py
+cd ~/code_project/music-project/backend
+~/miniconda3/envs/music/bin/python app.py
 
 # 测试推荐接口
 curl -X POST http://localhost:5000/api/recommend \
   -H "Content-Type: application/json" \
   -d '{"query": "欢快的凯尔特音乐", "session_id": "test_001"}'
 
-# 测试健康检查
-curl http://localhost:5000/api/health
+# 测试反馈接口
+curl -X POST http://localhost:5000/api/recommend/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"history_id": 1, "song_id": 1893728473, "feedback_type": "like"}'
+
+# 测试历史记录接口
+curl "http://localhost:5000/api/recommend/history?session_id=test_001"
 ```
+
+**阶段四测试措施**：
+
+| 测试项 | 验证方法 | 预期结果 |
+|--------|----------|----------|
+| 服务启动 | `~/miniconda3/envs/music/bin/python app.py` | 无报错，5000端口监听 |
+| 推荐接口 | `curl -X POST /api/recommend -d '{"query":"测试"}'` | 返回 JSON，包含 results 数组 |
+| 反馈接口 | `curl -X POST /api/recommend/feedback -d '{"history_id":1,"song_id":123}'` | 返回 `{"success": true}` |
+| 历史接口 | `curl "/api/recommend/history?session_id=test"` | 返回 JSON，包含 history 数组 |
+| 特征接口 | `curl /api/songs/1893728473/features` | 返回歌曲特征或 404（特征未生成） |
 
 ---
 
@@ -2308,6 +2391,16 @@ methods: {
 }
 ```
 
+**阶段五测试措施**：
+
+| 测试项 | 验证方法 | 预期结果 |
+|--------|----------|----------|
+| 前端编译 | `npm run build:h5` | 编译成功，生成 dist 文件 |
+| 推荐页面渲染 | 访问推荐页面 | 页面正常显示输入框和按钮 |
+| API 方法导入 | 检查 `index.ts` 中新增的 recommend 方法 | 无 lint 错误 |
+| 组件导入 | 检查 RecommendCard.vue 是否可被 import | 无报错 |
+| 入口跳转 | 点击 AI 推荐入口 | 跳转到推荐页面 |
+
 ---
 
 ### 6.6 阶段六：测试与部署（预计工作量：2-3天）
@@ -2411,6 +2504,18 @@ npm run build:h5
 npm run build:mp-weixin
 # 然后在微信开发者工具中上传
 ```
+
+**阶段六测试措施**：
+
+| 测试项 | 验证方法 | 预期结果 |
+|--------|----------|----------|
+| 推荐接口（完整） | 输入"欢快的凯尔特音乐" | 返回匹配结果，包含 match_score |
+| 古诗词推荐 | 输入"琵琶行" | 返回匹配结果 |
+| 反馈上报 | 播放完成后提交反馈 | 数据库中 feedback 记录增加 |
+| 跳过上报 | 点击跳过按钮 | 数据库中 skipped=true 的记录存在 |
+| 历史查询 | 查询同一 session_id 的历史 | 返回该会话的所有推荐记录 |
+| 特征生成 | 调用批量生成接口 | music_features 表记录数增加 |
+| 端到端测试 | 前端输入查询 → 后端匹配 → 返回前端展示 | 完整流程正常 |
 
 ---
 
@@ -2591,23 +2696,38 @@ npm run build:mp-weixin
 
 ### backend/.env 新增配置
 
+> **注意**：以下配置基于项目现有 `.env` 格式，新增配置应遵循相同的命名规范。MongoDB 配置已存在，无需重复添加。
+
 ```env
-# MiniMax LLM Configuration
+# MiniMax LLM Configuration（新增）
 LLM_PROVIDER=minimax
 MINIMAX_API_KEY=your_minimax_api_key
 MINIMAX_MODEL=abab6.5s-chat
 MINIMAX_EMBEDDING_MODEL=embo-01
 
-# Recommendation Settings
+# Recommendation Settings（新增）
 MAX_RECOMMEND_RESULTS=20
 RECOMMEND_TIMEOUT_MS=30000
 ENABLE_FEATURE_CACHE=true
 
-# MongoDB Configuration (for comments)
-MONGO_HOST=localhost
-MONGO_PORT=27017
-MONGO_DATABASE=music_comments
+# MongoDB Configuration（已存在，无需修改）
+# MONGO_HOST=localhost
+# MONGO_PORT=27017
+# MONGO_DB=netease
 ```
+
+**配置说明**：
+
+| 配置项 | 来源 | 说明 |
+|--------|------|------|
+| `LLM_PROVIDER` | 新增 | LLM 提供商 |
+| `MINIMAX_API_KEY` | 新增 | MiniMax API 密钥 |
+| `MINIMAX_MODEL` | 新增 | MiniMax 模型名称 |
+| `MINIMAX_EMBEDDING_MODEL` | 新增 | Embedding 模型名称 |
+| `MAX_RECOMMEND_RESULTS` | 新增 | 推荐结果最大数量 |
+| `RECOMMEND_TIMEOUT_MS` | 新增 | 推荐请求超时时间（毫秒） |
+| `ENABLE_FEATURE_CACHE` | 新增 | 是否启用特征缓存 |
+| `MONGO_HOST/PORT/DB` | 已存在 | MongoDB 配置，保持现有值不变 |
 
 ---
 
