@@ -950,7 +950,7 @@ Request:
 
 | 文件路径 | 说明 | 依赖 |
 |----------|------|------|
-| `backend/services/llm_service.py` | MiniMax API 封装（LLM调用） | minimax SDK |
+| `backend/services/llm_service.py` | LLM API 封装（OpenAI 兼容格式） | openai SDK 或 requests |
 | `backend/services/feature_service.py` | 歌曲特征提取服务 | llm_service.py |
 | `backend/services/recommend_service.py` | 推荐核心逻辑服务 | llm_service.py, feature_service.py |
 | `backend/routes/recommend.py` | 推荐相关 API 路由 | recommend_service.py |
@@ -964,9 +964,9 @@ Request:
 | 文件路径 | 修改内容 | 说明 |
 |----------|----------|------|
 | `backend/app.py` | 注册 `recommend_bp` Blueprint | 在 `create_app()` 中添加 |
-| `backend/config.py` | 新增配置项（LLM、MiniMax等） | 参考 8.配置文件更新 |
-| `backend/.env` | 新增环境变量 | MiniMax API Key、推荐相关配置 |
-| `backend/requirements.txt` | 新增依赖 | minimax-api |
+| `backend/config.py` | 新增配置项（LLM、推荐相关） | 参考 8.配置文件更新 |
+| `backend/.env` | 新增环境变量 | LLM API Key、推荐相关配置 |
+| `backend/requirements.txt` | 新增依赖 | openai（可选，requests 已内置） |
 
 > **注**：其他依赖（flask、psycopg2-binary、pymongo、python-dotenv）已在现有 requirements.txt 中，无需重复安装。
 
@@ -997,7 +997,7 @@ backend/
 
 | 文件 | 职责 |
 |------|------|
-| `llm_service.py` | 封装 MiniMax API，提供 chat 和 embedding 方法 |
+| `llm_service.py` | 封装 LLM API，提供 chat 和 embedding 方法 | OpenAI 兼容格式 |
 | `feature_service.py` | 管理歌曲特征生成，支持批量处理和定时任务 |
 | `recommend_service.py` | 实现推荐算法，调用 LLM 进行语义匹配 |
 | `routes/recommend.py` | 定义 REST API 端点，处理 HTTP 请求/响应 |
@@ -1116,85 +1116,75 @@ export default {
 
 3. **安装必要依赖**（必须在 conda 环境中）
    ```bash
-   ~/miniconda3/envs/music/bin/pip install flask psycopg2-binary pymongo redis minimax-api python-dotenv
+   ~/miniconda3/envs/music/bin/pip install flask psycopg2-binary pymongo redis openai python-dotenv
    ```
 
 4. **配置 .env 文件**（参考 8.配置文件更新）
 
-#### 6.1.2 MiniMax API 账号准备
+#### 6.1.2 LLM API 账号准备
 
-**目标**：获取 MiniMax API Key 并测试连通性
+**目标**：获取 LLM API Key 并测试连通性
+
+**说明**：设计文档不指定使用哪家厂商的专用 SDK，而是遵循" provider agnostic"原则：
+- 配置项：`LLM_PROVIDER_URL`（API 端点）、`LLM_PROVIDER_KEY`（API Key）、`LLM_MODEL_NAME`（模型名）
+- 只需一个能接受 OpenAI 格式请求的 API（MiniMax、OpenAI、Claude 等均可）
+- 代码层使用通用 HTTP 调用或 OpenAI 兼容库，不依赖专用 SDK
+
+> **注意**：初版使用纯 LLM 推荐（随机采样 + LLM 语义匹配），不依赖 Embedding 模型，所以 embedding 相关配置本节先跳过。
 
 **执行步骤**：
 
-1. 联系项目负责人获取 MiniMax API Key
-2. 测试 API 连通性：
-   ```python
-   from minimax import MiniMax
+1. **联系项目负责人获取 LLM API Key**（以 MiniMax 为例）
 
-   client = MiniMax(api_key="your_key")
-   # 测试 chat API（使用您指定的 MiniMax-2.7 模型）
+2. **测试 API 连通性**：
+   ```python
+   # 方案A：使用 openai 库（推荐，可无缝切换模型商）
+   from openai import OpenAI
+
+   client = OpenAI(
+       api_key="your_key",
+       base_url="https://api.minimax.chat"  # MiniMax 的 OpenAI 兼容端点
+   )
    response = client.chat.completions.create(
-       model="MiniMax-2.7",  # 或 "abab6.5s-chat"
+       model="abab6.5s-chat",  # 或您指定的模型名
        messages=[{"role": "user", "content": "你好"}]
    )
    print(response.choices[0].message.content)
-   ```
 
-3. **确认 embedding 模型**：
+   # 方案B：使用 requests（无需安装额外包，更轻量）
+   import requests
 
-   MiniMax 的 embedding 模型名称需要查证，建议方案如下：
-
-   **方案A（推荐）：使用本地 Embedding 模型**
-
-   使用开源的 sentence-transformers 模型，不依赖外部 API：
-   ```python
-   from sentence_transformers import SentenceTransformer
-
-   # 中文嵌入模型（推荐）
-   model = SentenceTransformer('BAAI/bge-base-zh-v1.5')
-
-   # 或多语言模型
-   model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-
-   # 生成向量
-   embedding = model.encode("测试文本")
-   ```
-
-   **方案B：使用 MiniMax Embedding API**（待查证）
-
-   如果 MiniMax 提供 embedding API，可使用：
-   ```python
-   # 注意：embo-01 需要确认是否可用
-   embedding = client.embeddings.create(
-       model="embo-01",  # 待查证
-       input="测试文本"
+   resp = requests.post(
+       "https://api.minimax.chat/v1/chat/completions",
+       headers={
+           "Authorization": f"Bearer your_key",
+           "Content-Type": "application/json"
+       },
+       json={
+           "model": "abab6.5s-chat",
+           "messages": [{"role": "user", "content": "你好"}]
+       }
    )
-   print(len(embedding.data[0].embedding))
+   print(resp.json())
    ```
 
-   **关于 MiniMax Embedding 模型**：MiniMax 官方支持的 embedding 模型名称需要参考官方文档。当前设计预留了两种方案，如果 MiniMax-2.7 配套有 `embedding-2.7` 或类似模型，建议使用；否则推荐使用本地模型（如 BAAI/bge 系列）。
-
-**MiniMax Embedding 模型查证清单**：
-
-| 模型名称 | 说明 | 状态 |
-|----------|------|------|
-| `embo-01` | 旧版模型名称 | 待确认 |
-| `embedding-2.7` | 与 LLM 配套 | 待查证 |
-| `BAAI/bge-base-zh-v1.5` | 本地开源模型 | 确认可用 |
+3. **确认 embedding 模型**（初版跳过）：
+   - 初版采用纯 LLM 推荐方案，不使用 Embedding/向量检索
+   - 特征匹配通过"随机采样约500首候选歌曲 + LLM 直接语义匹配"实现
+   - Embedding 向量检索作为后续扩展方向，详见 3.3.1 节
 
 **配置建议**：
 
 ```python
 # backend/config.py
 
-# 方案A：使用本地模型（推荐，初版使用）
-EMBEDDING_MODEL = 'BAAI/bge-base-zh-v1.5'
-EMBEDDING_DIMENSION = 768  # bge-base-zh-v1.5 的维度
+LLM_PROVIDER_URL = 'https://api.minimax.chat'
+LLM_PROVIDER_KEY = 'your_api_key'
+LLM_MODEL_NAME = 'abab6.5s-chat'
 
-# 方案B：使用 MiniMax API（如果可用）
-# MINIMAX_EMBEDDING_MODEL = 'embo-01'
-# EMBEDDING_DIMENSION = 1536
+# 如果以后切换到其他模型商（如 OpenAI），只需修改配置：
+# LLM_PROVIDER_URL = 'https://api.openai.com/v1'
+# LLM_MODEL_NAME = 'gpt-4o-mini'
 ```
 
 #### 6.1.3 前端环境检查
@@ -1369,7 +1359,7 @@ db.comments.createIndex({ "sentiment": 1, "polarity": 1 })
 
 ### 6.3 阶段三：后端核心功能开发（预计工作量：4-6天）
 
-#### 6.3.1 MiniMax API 封装模块
+#### 6.3.1 LLM API 封装模块
 
 **目标**：创建 `backend/services/llm_service.py`，封装 LLM 调用
 
@@ -1378,7 +1368,7 @@ db.comments.createIndex({ "sentiment": 1, "polarity": 1 })
 backend/
 ├── services/
 │   ├── __init__.py
-│   ├── llm_service.py      # MiniMax API 封装
+│   ├── llm_service.py      # LLM API 封装（OpenAI 兼容格式）
 │   ├── feature_service.py   # 歌曲特征服务
 │   └── recommend_service.py # 推荐服务
 ├── routes/
@@ -1394,17 +1384,16 @@ backend/
 # backend/services/llm_service.py
 
 import os
-from minimax import MiniMax
+from openai import OpenAI  # 或使用 requests 直接调用
 from typing import List, Dict, Optional
 
 class LLMService:
     def __init__(self):
-        self.client = MiniMax(
-            api_key=os.getenv("MINIMAX_API_KEY"),
-            base_url="https://api.minimax.chat"
+        self.client = OpenAI(
+            api_key=os.getenv("LLM_PROVIDER_KEY"),
+            base_url=os.getenv("LLM_PROVIDER_URL")  # 如 "https://api.minimax.chat"
         )
-        self.model = os.getenv("MINIMAX_MODEL", "abab6.5s-chat")
-        self.embedding_model = os.getenv("MINIMAX_EMBEDDING_MODEL", "embo-01")
+        self.model = os.getenv("LLM_MODEL_NAME", "abab6.5s-chat")
 
     def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
         """发送对话请求"""
@@ -1472,13 +1461,14 @@ class LLMService:
 3. 仅基于文本信息推断，不要假设未知信息
 """
 
-    def generate_embedding(self, text: str) -> List[float]:
-        """生成文本 embedding"""
-        response = self.client.embeddings.create(
-            model=self.embedding_model,
-            input=text
-        )
-        return response.data[0].embedding
+    # 注：初版不依赖 embedding，向量检索作为后续扩展方向
+    # def generate_embedding(self, text: str) -> List[float]:
+    #     """生成文本 embedding（预留）"""
+    #     response = self.client.embeddings.create(
+    #         model=self.embedding_model,
+    #         input=text
+    #     )
+    #     return response.data[0].embedding
 
     def match_songs_prompt(self, query: str, songs_context: str) -> str:
         """构建歌曲匹配 Prompt"""
@@ -2684,8 +2674,8 @@ npm run build:mp-weixin
 
 | 组件 | 选择 | 理由 |
 |------|------|------|
-| LLM Provider | **MiniMax** | 您指定使用MiniMax模型 |
-| Embedding | MiniMax Embedding API | 与LLM配套 |
+| LLM Provider | **MiniMax** | 您指定使用 MiniMax 模型（API 格式 OpenAI 兼容） |
+| Embedding | 本地模型或暂不启用 | 初版纯 LLM 推荐，不依赖 Embedding |
 | 向量数据库 | PostgreSQL pgvector (可选) | 扩展向量检索能力，先以标签匹配为主 |
 | 缓存层 | Redis (可选) | 高并发场景优化 |
 | 语音识别 | 微信小程序API / 讯飞API (预留) | 语音输入扩展 |
@@ -2699,11 +2689,10 @@ npm run build:mp-weixin
 > **注意**：以下配置基于项目现有 `.env` 格式，新增配置应遵循相同的命名规范。MongoDB 配置已存在，无需重复添加。
 
 ```env
-# MiniMax LLM Configuration（新增）
-LLM_PROVIDER=minimax
-MINIMAX_API_KEY=your_minimax_api_key
-MINIMAX_MODEL=abab6.5s-chat
-MINIMAX_EMBEDDING_MODEL=embo-01
+# LLM Configuration（通用配置，支持任意 OpenAI 兼容 API）
+LLM_PROVIDER_URL=https://api.minimax.chat
+LLM_PROVIDER_KEY=your_api_key
+LLM_MODEL_NAME=abab6.5s-chat
 
 # Recommendation Settings（新增）
 MAX_RECOMMEND_RESULTS=20
@@ -2720,10 +2709,9 @@ ENABLE_FEATURE_CACHE=true
 
 | 配置项 | 来源 | 说明 |
 |--------|------|------|
-| `LLM_PROVIDER` | 新增 | LLM 提供商 |
-| `MINIMAX_API_KEY` | 新增 | MiniMax API 密钥 |
-| `MINIMAX_MODEL` | 新增 | MiniMax 模型名称 |
-| `MINIMAX_EMBEDDING_MODEL` | 新增 | Embedding 模型名称 |
+| `LLM_PROVIDER_URL` | 新增 | LLM API 端点（OpenAI 兼容格式） |
+| `LLM_PROVIDER_KEY` | 新增 | LLM API 密钥 |
+| `LLM_MODEL_NAME` | 新增 | 模型名称（abab6.5s-chat / gpt-4o-mini 等） |
 | `MAX_RECOMMEND_RESULTS` | 新增 | 推荐结果最大数量 |
 | `RECOMMEND_TIMEOUT_MS` | 新增 | 推荐请求超时时间（毫秒） |
 | `ENABLE_FEATURE_CACHE` | 新增 | 是否启用特征缓存 |
