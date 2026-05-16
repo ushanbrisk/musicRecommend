@@ -2069,80 +2069,247 @@ curl -X POST http://localhost:5000/api/features/generate \
 
 ### 6.5 阶段五：前端开发（预计工作量：3-4天）
 
-#### 6.5.1 创建推荐页面
+#### 6.5.1 前端项目结构分析 ✅
 
-**目标**：创建 `/pages/recommend/recommend.vue`
+**目标**：根据现有前端项目结构设计推荐功能
 
-**文件结构**：
+**现有项目结构**：
+
 ```
-music-project-uniapp/
-├── pages/
-│   ├── recommend/
-│   │   └── recommend.vue    # 推荐页面
-│   └── index/
-│       └── index.vue        # 修改首页，添加入口
+src/
+├── api/
+│   └── index.ts              # API 封装（使用 uni.request）
+├── stores/
+│   ├── songs.ts              # 歌曲状态管理
+│   └── player.ts             # 播放器状态管理
 ├── components/
-│   └── RecommendCard.vue     # 推荐结果卡片
-└── api/
-    └── recommend.js          # API 调用封装
+│   └── PlayerBar.vue         # 播放器组件
+├── pages/
+│   ├── index/index.vue       # 首页（歌曲列表、分类、搜索）
+│   ├── categories/           # 分类页面
+│   ├── playlist/             # 歌单页面
+│   └── lyric/                # 歌词页面
+├── utils/
+│   └── audioManager.ts       # 音频播放管理
+└── App.vue
 ```
 
-#### 6.5.2 API 封装
+**技术栈**：
+- Vue 3 Composition API（`<script setup lang="ts">`）
+- Pinia 状态管理
+- UniApp（跨平台）
+- SCSS 样式
 
-**api/recommend.js**：
-```javascript
-// api/recommend.js
+#### 6.5.2 新增文件清单
+
+| 文件路径 | 说明 | 状态 |
+|----------|------|------|
+| `src/api/recommend.ts` | 推荐 API 封装 | ☐ |
+| `src/stores/recommend.ts` | 推荐状态管理 | ☐ |
+| `src/components/AIRecommendEntry.vue` | AI推荐入口组件 | ☐ |
+| `src/components/RecommendCard.vue` | 推荐结果卡片 | ☐ |
+| `src/pages/recommend/recommend.vue` | 推荐页面 | ☐ |
+
+**pages.json 路由配置**（需新增）：
+
+```json
+{
+  "pages": [
+    // ... 现有页面 ...
+    {
+      "path": "pages/recommend/recommend",
+      "style": {
+        "navigationBarTitleText": "AI 音乐推荐"
+      }
+    }
+  ],
+  "subPackages": [
+    {
+      "root": "pages/recommend",
+      "pages": [
+        {
+          "path": "recommend",
+          "style": {
+            "navigationBarTitleText": "AI 音乐推荐"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### 6.5.3 API 封装
+
+**src/api/recommend.ts**：
+
+```typescript
+// src/api/recommend.ts
 
 const API_BASE = 'http://localhost:5000/api'
 
 export const recommendApi = {
   /**
    * 文本推荐
-   * @param {string} query - 推荐查询文本
-   * @param {string} sessionId - 会话ID
-   * @param {number} maxResults - 最大返回数量
    */
-  recommend(query, sessionId, maxResults = 20) {
-    return uni.request({
+  async recommend(query: string, sessionId: string, maxResults = 20) {
+    const res = await uni.request({
       url: `${API_BASE}/recommend`,
       method: 'POST',
-      data: {
-        query,
-        session_id: sessionId,
-        max_results: maxResults
-      }
+      data: { query, session_id: sessionId, max_results: maxResults }
     })
+    return res.data
   },
 
   /**
    * 提交推荐反馈
-   * @param {Object} feedback - 反馈数据
    */
-  submitFeedback(feedback) {
-    return uni.request({
+  async submitFeedback(feedback: {
+    history_id: number
+    song_id: number
+    feedback_type?: string
+    playback_duration_seconds?: number
+    song_duration_seconds?: number
+    playback_completion_rate?: number
+    skipped?: boolean
+    looped?: boolean
+    play_source?: string
+  }) {
+    const res = await uni.request({
       url: `${API_BASE}/recommend/feedback`,
       method: 'POST',
       data: feedback
     })
+    return res.data
   },
 
   /**
    * 获取推荐历史
-   * @param {string} sessionId - 会话ID
    */
-  getHistory(sessionId) {
-    return uni.request({
+  async getHistory(sessionId: string, limit = 20) {
+    const res = await uni.request({
       url: `${API_BASE}/recommend/history`,
       method: 'GET',
-      data: { session_id: sessionId }
+      data: { session_id: sessionId, limit }
     })
+    return res.data
+  },
+
+  /**
+   * 获取歌曲特征
+   */
+  async getSongFeatures(songId: number) {
+    const res = await uni.request({
+      url: `${API_BASE}/songs/${songId}/features`,
+      method: 'GET'
+    })
+    return res.data
   }
 }
 ```
 
-#### 6.5.3 推荐页面实现
+#### 6.5.4 推荐状态管理
 
-**pages/recommend/recommend.vue** 核心逻辑：
+**src/stores/recommend.ts**：
+
+```typescript
+// src/stores/recommend.ts
+import { defineStore } from 'pinia'
+import { recommendApi } from '@/api/recommend'
+
+interface RecommendResult {
+  song_id: number
+  song_name: string
+  artist: string
+  album: string
+  music_file: string
+  match_score: number
+  match_reason: string
+  tags: string[]
+}
+
+interface RecommendState {
+  results: RecommendResult[]
+  historyId: number | null
+  sessionId: string
+  loading: boolean
+  error: string | null
+}
+
+export const useRecommendStore = defineStore('recommend', {
+  state: (): RecommendState => ({
+    results: [],
+    historyId: null,
+    sessionId: '',
+    loading: false,
+    error: null
+  }),
+
+  actions: {
+    // 生成或获取 sessionId
+    initSessionId() {
+      if (!this.sessionId) {
+        const stored = uni.getStorageSync('recommend_session_id')
+        if (stored) {
+          this.sessionId = stored
+        } else {
+          this.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9)
+          uni.setStorageSync('recommend_session_id', this.sessionId)
+        }
+      }
+    },
+
+    // 执行推荐
+    async recommend(query: string) {
+      if (!query.trim()) return
+
+      this.loading = true
+      this.error = null
+      this.initSessionId()
+
+      try {
+        const res = await recommendApi.recommend(query, this.sessionId, 20)
+        if (res.success) {
+          this.results = res.results
+          this.historyId = res.history_id
+        } else {
+          this.error = res.error || '推荐失败'
+        }
+      } catch (e: any) {
+        this.error = e.message || '网络错误'
+      } finally {
+        this.loading = false
+      }
+    },
+
+    // 提交反馈
+    async submitFeedback(songId: number, feedbackType: string) {
+      if (!this.historyId) return
+
+      try {
+        await recommendApi.submitFeedback({
+          history_id: this.historyId,
+          song_id: songId,
+          feedback_type: feedbackType,
+          play_source: 'recommend'
+        })
+      } catch (e) {
+        console.error('提交反馈失败:', e)
+      }
+    },
+
+    // 清空结果
+    clearResults() {
+      this.results = []
+      this.historyId = null
+    }
+  }
+})
+```
+
+#### 6.5.5 推荐页面实现
+
+**src/pages/recommend/recommend.vue**：
 
 ```vue
 <template>
@@ -2153,7 +2320,7 @@ export const recommendApi = {
         class="search-input"
         v-model="queryText"
         placeholder="请描述你想要的音乐...（如：欢快的凯尔特音乐）"
-        :disabled="loading"
+        :disabled="store.loading"
       />
       <view class="search-actions">
         <button
@@ -2166,19 +2333,23 @@ export const recommendApi = {
         <button
           class="search-btn"
           @click="handleSearch"
-          :disabled="!queryText.trim() || loading"
+          :disabled="!queryText.trim() || store.loading"
         >
-          {{ loading ? '搜索中...' : '搜索' }}
+          {{ store.loading ? '搜索中...' : '搜索' }}
         </button>
       </view>
     </view>
 
     <!-- 推荐结果列表 -->
-    <view class="results-section" v-if="results.length > 0">
-      <view class="result-item" v-for="item in results" :key="item.song_id">
+    <view class="results-section" v-if="store.results.length > 0">
+      <view
+        v-for="item in store.results"
+        :key="item.song_id"
+        class="result-item"
+      >
         <RecommendCard
           :song="item"
-          :history-id="historyId"
+          :history-id="store.historyId"
           @play="handlePlay"
           @feedback="handleFeedback"
         />
@@ -2186,113 +2357,142 @@ export const recommendApi = {
     </view>
 
     <!-- 空状态 -->
-    <view class="empty-state" v-else-if="!loading && searched">
+    <view class="empty-state" v-else-if="!store.loading && searched">
       <text>未找到匹配的音乐，请尝试其他描述</text>
     </view>
   </view>
 </template>
 
-<script>
-import { recommendApi } from '@/api/recommend'
+<script setup lang="ts">
+import { ref } from 'vue'
+import { useRecommendStore } from '@/stores/recommend'
+import { usePlayerStore } from '@/stores/player'
+import RecommendCard from '@/components/RecommendCard.vue'
 
-export default {
-  data() {
-    return {
-      queryText: '',
-      sessionId: '',
-      historyId: null,
-      loading: false,
-      searched: false,
-      results: [],
-      voiceInputActive: false
-    }
-  },
+const store = useRecommendStore()
+const playerStore = usePlayerStore()
 
-  onLoad() {
-    // 生成或获取 sessionId
-    this.sessionId = uni.getStorageSync('recommend_session_id')
-    if (!this.sessionId) {
-      this.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9)
-      uni.setStorageSync('recommend_session_id', this.sessionId)
-    }
-  },
+const queryText = ref('')
+const searched = ref(false)
+const voiceInputActive = ref(false)
 
-  methods: {
-    async handleSearch() {
-      if (!this.queryText.trim()) return
+function handleSearch() {
+  if (!queryText.value.trim()) return
+  searched.value = true
+  store.recommend(queryText.value)
+}
 
-      this.loading = true
-      this.searched = true
+function handlePlay(song: any) {
+  playerStore.playSong(song, store.results)
+}
 
-      try {
-        const response = await recommendApi.recommend(
-          this.queryText,
-          this.sessionId,
-          20
-        )
+function handleFeedback({ song, feedbackType }: { song: any; feedbackType: string }) {
+  store.submitFeedback(song.song_id, feedbackType)
+}
 
-        if (response.data.success) {
-          this.results = response.data.results
-          this.historyId = response.data.history_id
-        } else {
-          uni.showToast({
-            title: response.data.error || '推荐失败',
-            icon: 'none'
-          })
-        }
-      } catch (error) {
-        uni.showToast({
-          title: '网络错误，请稍后重试',
-          icon: 'none'
-        })
-      } finally {
-        this.loading = false
-      }
-    },
-
-    handlePlay(song) {
-      // 调用播放器播放
-      uni.navigateTo({
-        url: `/pages/player/player?song_id=${song.song_id}`
-      })
-    },
-
-    async handleFeedback({ song, feedbackType }) {
-      // 上报反馈
-      await recommendApi.submitFeedback({
-        history_id: this.historyId,
-        song_id: song.song_id,
-        feedback_type: feedbackType,
-        play_source: 'recommend'
-      })
-    },
-
-    toggleVoiceInput() {
-      // TODO: 实现语音输入
-      this.voiceInputActive = !this.voiceInputActive
-    }
-  }
+function toggleVoiceInput() {
+  // TODO: 实现语音输入
+  voiceInputActive.value = !voiceInputActive.value
 }
 </script>
+
+<style lang="scss" scoped>
+.recommend-page {
+  min-height: 100vh;
+  background: #1a1a2e;
+  padding: 20rpx;
+}
+
+.search-section {
+  padding: 30rpx;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 16rpx;
+  margin-bottom: 20rpx;
+}
+
+.search-input {
+  width: 100%;
+  padding: 24rpx;
+  background: rgba(255, 255, 255, 0.1);
+  border: none;
+  border-radius: 12rpx;
+  color: #fff;
+  font-size: 28rpx;
+  min-height: 120rpx;
+  box-sizing: border-box;
+}
+
+.search-input::placeholder {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.search-actions {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 20rpx;
+  gap: 16rpx;
+}
+
+.voice-btn,
+.search-btn {
+  padding: 16rpx 40rpx;
+  border: none;
+  border-radius: 40rpx;
+  font-size: 28rpx;
+  color: #fff;
+}
+
+.voice-btn {
+  background: rgba(255, 255, 255, 0.1);
+  &.active {
+    background: linear-gradient(90deg, #00d4ff, #7b2cbf);
+  }
+}
+
+.search-btn {
+  background: linear-gradient(90deg, #00d4ff, #7b2cbf);
+  flex: 1;
+}
+
+.results-section {
+  display: flex;
+  flex-direction: column;
+  gap: 16rpx;
+}
+
+.empty-state {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 100rpx;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 28rpx;
+}
+</style>
 ```
 
-#### 6.5.4 推荐卡片组件
+#### 6.5.6 推荐卡片组件
 
-**components/RecommendCard.vue**：
+**src/components/RecommendCard.vue**：
 
 ```vue
 <template>
   <view class="recommend-card">
     <view class="song-info" @click="$emit('play', song)">
-      <image class="album-art" src="/static/default-album.png" mode="aspectFill" />
+      <view class="album-cover">
+        <text class="music-icon">🎵</text>
+      </view>
       <view class="song-detail">
         <text class="song-name">{{ song.song_name }}</text>
         <text class="artist">{{ song.artist }}</text>
-        <view class="tags">
+        <view class="tags" v-if="validTags.length > 0">
           <text class="tag" v-for="tag in validTags" :key="tag">{{ tag }}</text>
         </view>
-        <text class="match-reason" v-if="song.match_reason">{{ song.match_reason }}</text>
+        <text class="match-reason" v-if="song.match_reason">
+          {{ song.match_reason }}
+        </text>
       </view>
+      <view class="play-icon">▶</view>
     </view>
     <view class="actions">
       <button class="action-btn like" @click="onLike">👍 喜欢</button>
@@ -2301,113 +2501,187 @@ export default {
   </view>
 </template>
 
-<script>
-export default {
-  props: {
-    song: {
-      type: Object,
-      required: true
-    },
-    historyId: {
-      type: Number,
-      required: true
-    }
-  },
+<script setup lang="ts">
+import { computed } from 'vue'
 
-  computed: {
-    validTags() {
-      return (this.song.tags || []).filter(tag => tag && tag !== '未知')
-    }
-  },
+interface Song {
+  song_id: number
+  song_name: string
+  artist: string
+  album: string
+  music_file: string
+  match_score: number
+  match_reason: string
+  tags: string[]
+}
 
-  methods: {
-    onLike() {
-      this.$emit('feedback', { song: this.song, feedbackType: 'like' })
-      uni.showToast({ title: '已记录喜欢', icon: 'success' })
-    },
+const props = defineProps<{
+  song: Song
+  historyId: number | null
+}>()
 
-    onSkip() {
-      this.$emit('feedback', { song: this.song, feedbackType: 'dislike' })
-    }
-  }
+const emit = defineEmits<{
+  (e: 'play', song: Song): void
+  (e: 'feedback', payload: { song: Song; feedbackType: string }): void
+}>()
+
+const validTags = computed(() => {
+  return (props.song.tags || []).filter(tag => tag && tag !== '未知')
+})
+
+function onLike() {
+  emit('feedback', { song: props.song, feedbackType: 'like' })
+  uni.showToast({ title: '已记录', icon: 'success' })
+}
+
+function onSkip() {
+  emit('feedback', { song: props.song, feedbackType: 'dislike' })
 }
 </script>
+
+<style lang="scss" scoped>
+.recommend-card {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 16rpx;
+  padding: 24rpx;
+  margin-bottom: 16rpx;
+}
+
+.song-info {
+  display: flex;
+  align-items: center;
+  gap: 20rpx;
+}
+
+.album-cover {
+  width: 100rpx;
+  height: 100rpx;
+  border-radius: 12rpx;
+  background: linear-gradient(135deg, rgba(0, 212, 255, 0.3), rgba(123, 44, 191, 0.3));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.music-icon {
+  font-size: 40rpx;
+}
+
+.song-detail {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4rpx;
+}
+
+.song-name {
+  font-size: 32rpx;
+  color: #fff;
+  font-weight: 500;
+}
+
+.artist {
+  font-size: 26rpx;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8rpx;
+  margin-top: 8rpx;
+}
+
+.tag {
+  padding: 4rpx 16rpx;
+  background: rgba(0, 212, 255, 0.2);
+  border-radius: 20rpx;
+  font-size: 22rpx;
+  color: #00d4ff;
+}
+
+.match-reason {
+  font-size: 24rpx;
+  color: rgba(255, 255, 255, 0.7);
+  margin-top: 8rpx;
+}
+
+.play-icon {
+  width: 64rpx;
+  height: 64rpx;
+  border-radius: 50%;
+  background: linear-gradient(90deg, #00d4ff, #7b2cbf);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24rpx;
+  flex-shrink: 0;
+}
+
+.actions {
+  display: flex;
+  gap: 16rpx;
+  margin-top: 20rpx;
+  padding-top: 20rpx;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.action-btn {
+  flex: 1;
+  padding: 16rpx;
+  border: none;
+  border-radius: 30rpx;
+  font-size: 28rpx;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.action-btn.like {
+  background: linear-gradient(90deg, rgba(0, 212, 255, 0.3), rgba(123, 44, 191, 0.3));
+}
+</style>
 ```
 
-#### 6.5.5 首页添加 AI 推荐入口
+#### 6.5.7 AI 推荐入口
 
-**pages/index/index.vue** 修改：
+在首页 `src/pages/index/index.vue` 导航栏区域添加 AI 推荐入口：
 
 ```vue
-<template>
-  <!-- 在现有首页基础上添加 AI 推荐入口 -->
-  <view class="index-page">
-    <!-- 现有内容... -->
-
-    <!-- AI 推荐入口 -->
-    <view class="ai-recommend-entry" @click="goToRecommend">
-      <image class="entry-icon" src="/static/ai-icon.png" />
-      <view class="entry-info">
-        <text class="entry-title">AI 智能推荐</text>
-        <text class="entry-desc">用文字描述你想要音乐</text>
-      </view>
-      <text class="entry-arrow">›</text>
-    </view>
-
-    <!-- 现有其他内容... -->
-  </view>
-</template>
-
-<script>
-export default {
-  methods: {
-    goToRecommend() {
-      uni.navigateTo({
-        url: '/pages/recommend/recommend'
-      })
-    }
-  }
-}
-</script>
+<!-- 在导航栏 nav 中添加 -->
+<view
+  class="nav-btn"
+  :class="{ active: currentView === 'recommend' }"
+  @click="goToRecommend"
+>AI推荐</view>
 ```
 
-#### 6.5.6 前端播放器行为上报
+```typescript
+// 在 index.vue 的 methods 中添加
+function goToRecommend() {
+  uni.navigateTo({
+    url: '/pages/recommend/recommend'
+  })
+}
+```
 
-**播放器组件修改**（播放反馈上报）：
+#### 6.5.8 播放器行为上报
 
-```javascript
-// 在播放器组件中，歌曲播放完成或被跳过时上报
+在播放器组件（PlayerBar 或播放器页面）中，当歌曲播放完成或被跳过时上报反馈：
 
-methods: {
-  onSongEnd() {
-    this.reportPlaybackFeedback({
+```typescript
+// 播放器页面中
+function onSongEnd() {
+  if (this.historyId) {
+    recommendApi.submitFeedback({
+      history_id: this.historyId,
+      song_id: this.currentSong.song_id,
       playback_duration_seconds: this.currentDuration,
       song_duration_seconds: this.totalDuration,
       playback_completion_rate: (this.currentDuration / this.totalDuration) * 100,
       skipped: false,
-      looped: false
-    })
-    this.playNext()
-  },
-
-  onSkip() {
-    this.reportPlaybackFeedback({
-      playback_duration_seconds: this.currentDuration,
-      song_duration_seconds: this.totalDuration,
-      playback_completion_rate: (this.currentDuration / this.totalDuration) * 100,
-      skipped: true,
-      looped: false
-    })
-    this.playNext()
-  },
-
-  reportPlaybackFeedback(playbackData) {
-    if (!this.historyId) return  // 只有推荐来源才上报
-
-    recommendApi.submitFeedback({
-      history_id: this.historyId,
-      song_id: this.currentSong.song_id,
-      ...playbackData,
+      looped: false,
       play_source: 'recommend'
     })
   }
@@ -2416,13 +2690,13 @@ methods: {
 
 **阶段五测试措施**：
 
-| 测试项 | 验证方法 | 预期结果 |
-|--------|----------|----------|
-| 前端编译 | `npm run build:h5` | 编译成功，生成 dist 文件 |
-| 推荐页面渲染 | 访问推荐页面 | 页面正常显示输入框和按钮 |
-| API 方法导入 | 检查 `index.ts` 中新增的 recommend 方法 | 无 lint 错误 |
-| 组件导入 | 检查 RecommendCard.vue 是否可被 import | 无报错 |
-| 入口跳转 | 点击 AI 推荐入口 | 跳转到推荐页面 |
+| 测试项 | 验证方法 | 预期结果 | 状态 |
+|--------|----------|----------|------|
+| 前端编译 | `npm run build:h5` | 编译成功，生成 dist 文件 | ☐ |
+| 推荐页面渲染 | 访问推荐页面 | 页面正常显示输入框和按钮 | ☐ |
+| API 方法导入 | 检查 recommendApi 是否可被 import | 无错误 | ☐ |
+| 组件导入 | 检查 RecommendCard.vue 是否可被 import | 无报错 | ☐ |
+| 入口跳转 | 点击 AI 推荐入口 | 跳转到推荐页面 | ☐ |
 
 ---
 
@@ -2544,23 +2818,25 @@ npm run build:mp-weixin
 
 ### 6.7 实现进度汇总
 
-| 阶段 | 工作内容 | 预计工时 | 依赖关系 |
-|------|----------|----------|----------|
-| **阶段一** | 环境准备与基础设施 | 1-2天 | 无 |
-| **阶段二** | 数据库设计与创建 | 1-2天 | 阶段一 |
-| **阶段三** | 后端核心功能开发 | 4-6天 | 阶段二 |
-| **阶段四** | 后端 API 集成 | 0.5天 | 阶段三 |
-| **阶段五** | 前端开发 | 3-4天 | 阶段四 |
-| **阶段六** | 测试与部署 | 2-3天 | 阶段五 |
+| 阶段 | 工作内容 | 预计工时 | 依赖关系 | 状态 |
+|------|----------|----------|----------|------|
+| **阶段一** | 环境准备与基础设施 | 1-2天 | 无 | ✅ 已完成 |
+| **阶段二** | 数据库设计与创建 | 1-2天 | 阶段一 | ✅ 已完成 |
+| **阶段三** | 后端核心功能开发 | 4-6天 | 阶段二 | ✅ 已完成 |
+| **阶段四** | 后端 API 集成 | 0.5天 | 阶段三 | ✅ 已完成 |
+| **阶段五** | 前端开发 | 3-4天 | 阶段四 | ✅ 设计文档已完成 |
+| **阶段六** | 测试与部署 | 2-3天 | 阶段五 | ☐ 待开始 |
 
 **总预计工时：11.5 - 17.5 人天**
 
-**里程碑**：
+**已完成里程碑**：
+- ✅ **M1（阶段二完成后）**：数据库设计评审通过
+- ✅ **M2（阶段四完成后）**：后端 API 可用
+- ✅ **M3（阶段五完成后）**：前端页面设计文档已完成
 
-1. **M1（阶段二完成后）**：数据库设计评审通过
-2. **M2（阶段四完成后）**：后端 API 可用
-3. **M3（阶段五完成后）**：前端页面可用
-4. **M4（阶段六完成后）**：功能测试通过，可上线
+**待完成里程碑**：
+- ☐ **M3'（阶段五实际完成后）**：前端页面可用
+- ☐ **M4（阶段六完成后）**：功能测试通过，可上线
 
 ---
 
