@@ -2100,16 +2100,31 @@ src/
 - UniApp（跨平台）
 - SCSS 样式
 
-#### 6.5.2 新增文件清单
+#### 6.5.2 新增/修改文件清单
 
-| 文件路径 | 说明 | 状态 |
-|----------|------|------|
-| `src/api/recommend.ts` | 推荐 API 封装 | ☐ |
-| `src/stores/recommend.ts` | 推荐状态管理 | ☐ |
-| `src/components/RecommendCard.vue` | 推荐结果卡片 | ☐ |
-| `src/pages/recommend/recommend.vue` | AI 推荐页面 | ☐ |
+**新增文件（4个）：**
 
-**pages.json 路由配置**（需新增）：
+| 文件路径 | 说明 |
+|----------|------|
+| `src/api/recommend.ts` | 推荐 API 封装 |
+| `src/stores/recommend.ts` | 推荐状态管理 |
+| `src/components/RecommendCard.vue` | 推荐结果卡片 |
+| `src/pages/recommend/recommend.vue` | AI 推荐页面 |
+
+**修改文件（2个）：**
+
+| 文件路径 | 说明 |
+|----------|------|
+| `src/pages.json` | 添加推荐页面路由 |
+| `src/pages/index/index.vue` | 添加"AI推荐"导航按钮 |
+
+**删除文件（1个）：**
+
+| 文件路径 | 说明 |
+|----------|------|
+| `src/components/AIRecommendEntry.vue` | 根据审查意见删除（仅保留导航入口） |
+
+**pages.json 路由配置**（需修改）：
 
 ```json
 {
@@ -2773,23 +2788,121 @@ function goToRecommend() {
 
 #### 6.5.8 播放器行为上报
 
-在播放器组件（PlayerBar 或播放器页面）中，当歌曲播放完成或被跳过时上报反馈：
+**影响范围**：
+
+当推荐来源的歌曲播放完成或被跳过时，需要上报播放反馈。会影响到以下文件：
+
+| 文件 | 影响说明 |
+|------|----------|
+| `src/stores/player.ts` | 需要新增 `currentHistoryId` 状态和 `reportPlaybackFeedback()` 方法 |
+| `src/components/PlayerBar.vue` | 需要监听播放完成事件并调用 store 的上报方法 |
+| `src/utils/audioManager.ts` | 可能需要在音频播放完成时触发状态更新 |
+
+**实现方案**：
+
+**方案 A：在 stores/player.ts 中实现（推荐）**
 
 ```typescript
-// 播放器页面中
-function onSongEnd() {
-  if (this.historyId) {
-    recommendApi.submitFeedback({
-      history_id: this.historyId,
-      song_id: this.currentSong.song_id,
-      playback_duration_seconds: this.currentDuration,
-      song_duration_seconds: this.totalDuration,
-      playback_completion_rate: (this.currentDuration / this.totalDuration) * 100,
-      skipped: false,
+// stores/player.ts 新增状态和方法
+
+// 新增状态
+state: () => ({
+  // ... 现有状态
+  currentHistoryId: null as number | null  // 当前推荐的 history_id
+}),
+
+// 新增方法
+actions: {
+  /**
+   * 设置当前推荐的 history_id
+   */
+  setCurrentHistoryId(historyId: number | null) {
+    this.currentHistoryId = historyId
+  },
+
+  /**
+   * 上报播放反馈
+   * 在歌曲播放完成或被跳过时调用
+   */
+  async reportPlaybackFeedback(params: {
+    playback_duration_seconds: number
+    song_duration_seconds: number
+    playback_completion_rate: number
+    skipped: boolean
+    looped: boolean
+  }) {
+    if (!this.currentHistoryId || !this.currentSong) return
+
+    try {
+      await recommendApi.submitFeedback({
+        history_id: this.currentHistoryId,
+        song_id: this.currentSong.song_id,
+        ...params,
+        play_source: 'recommend'
+      })
+    } catch (e) {
+      console.error('上报播放反馈失败:', e)
+    }
+  },
+
+  /**
+   * 播放下一首（带反馈上报）
+   */
+  next() {
+    // 先上报当前歌曲的播放反馈
+    if (this.currentHistoryId && this.currentSong) {
+      this.reportPlaybackFeedback({
+        playback_duration_seconds: this.currentTime,
+        song_duration_seconds: this.duration,
+        playback_completion_rate: (this.currentTime / this.duration) * 100,
+        skipped: true,
+        looped: false
+      })
+    }
+    // 执行切换
+    // ... 原有逻辑
+  }
+}
+```
+
+**方案 B：在 PlayerBar.vue 中实现**
+
+在 `PlayerBar.vue` 的 `onNext()` 或播放完成回调中直接调用：
+
+```typescript
+// PlayerBar.vue
+async function onNext() {
+  // 上报反馈
+  if (playerStore.currentHistoryId) {
+    await recommendApi.submitFeedback({
+      history_id: playerStore.currentHistoryId,
+      song_id: playerStore.currentSong.song_id,
+      playback_duration_seconds: playerStore.currentTime,
+      song_duration_seconds: playerStore.duration,
+      playback_completion_rate: (playerStore.currentTime / playerStore.duration) * 100,
+      skipped: true,
       looped: false,
       play_source: 'recommend'
     })
   }
+  playerStore.next()
+}
+```
+
+**推荐方案 A**，原因：
+1. 状态管理集中在 store，逻辑更清晰
+2. PlayerBar 只负责 UI，其他组件也可复用上报逻辑
+3. 便于后续扩展（如在 lyric 页面等其他播放场景也上报）
+
+**推荐页面的调用**：
+
+在 `recommend.vue` 的 `handlePlay()` 中设置 `historyId`：
+
+```typescript
+function handlePlay(song: RecommendSong) {
+  // 设置当前推荐的 history_id，用于后续播放时上报
+  playerStore.setCurrentHistoryId(store.historyId)
+  playerStore.playSong(song as any, store.results as any)
 }
 ```
 
