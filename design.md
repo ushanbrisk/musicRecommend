@@ -1189,9 +1189,9 @@ LLM_MODEL_NAME = 'abab6.5s-chat'
 
 #### 6.1.3 前端环境检查
 
-**目标**：确认 UniApp 项目可运行
+> **状态**：前端项目已正常运行，本节检查步骤跳过。
 
-**执行步骤**：
+**说明**：项目使用 UniApp CLI（`@dcloudio/uni-` 系列），不是 Vue CLI。验证步骤如下（供参考，如已确认项目正常可跳过）：
 
 1. **检查 Node.js 环境**
    ```bash
@@ -1199,17 +1199,15 @@ LLM_MODEL_NAME = 'abab6.5s-chat'
    npm --version
    ```
 
-2. **检查 UniApp CLI**
-   ```bash
-   npx vue --version
-   # 或
-   npm install -g @vue/cli
-   ```
-
-3. **安装项目依赖**
+2. **检查 UniApp 是否可用**（项目已使用，无需额外安装）
    ```bash
    cd ~/code_project/music-project-uniapp
-   npm install
+   npm run dev:h5  # 启动 H5 开发服务
+   ```
+
+3. **确认依赖已安装**（项目目录已有 node_modules，可跳过）
+   ```bash
+   ls node_modules/@dcloudio  # 确认 uni 相关包存在
    ```
 
 **阶段一测试措施**：
@@ -1218,8 +1216,8 @@ LLM_MODEL_NAME = 'abab6.5s-chat'
 |--------|----------|----------|
 | 后端服务启动 | `~/miniconda3/envs/music/bin/python app.py` | 服务启动在 5000 端口 |
 | 数据库连接 | 访问 `GET /api/songs` | 返回歌曲列表（非空） |
-| 前端服务启动 | `npm run dev` | H5 服务启动在 8080 端口 |
-| MiniMax API | 编写测试脚本调用 chat 接口 | 返回正常的对话结果 |
+| 前端服务启动 | `npm run dev:h5` | H5 服务启动在 8080 端口 |
+| LLM API | 编写测试脚本调用 chat 接口 | 返回正常的对话结果 |
 
 ---
 
@@ -1333,15 +1331,28 @@ LLM_MODEL_NAME = 'abab6.5s-chat'
    \dt music_features recommendation_history recommendation_feedback
    ```
 
-#### 6.2.2 创建 MongoDB 索引（如使用 MongoDB 存储评论）
+#### 6.2.2 MongoDB 索引状态
 
-**目标**：确保评论集合有适当索引
+**说明**：评论集合（`comments`）的索引已存在，无需重复创建。
 
+当前索引状态：
 ```javascript
-// 在 MongoDB shell 中执行
-use music_comments
+[
+  { v: 2, key: { _id: 1 }, name: '_id_' },
+  { v: 2, key: { commentId: 1 }, name: 'commentId_1', unique: true },
+  { v: 2, key: { song_id: 1, commentId: 1 }, name: 'song_id_1_commentId_1' }
+]
+```
 
-db.comments.createIndex({ "song_id": 1 })
+| 索引名 | 字段 | 类型 | 用途 |
+|--------|------|------|------|
+| `_id_` | `_id` | 主键 | 默认索引 |
+| `commentId_1` | `commentId` | 唯一 | 防止重复评论 |
+| `song_id_1_commentId_1` | `song_id, commentId` | 复合 | 按歌曲快速查评论 |
+
+**如需额外索引**（按需执行）：
+```javascript
+// 如需按情感查询，可创建：
 db.comments.createIndex({ "sentiment": 1, "polarity": 1 })
 ```
 
@@ -1976,61 +1987,83 @@ def get_db_cursor():
 
 ### 6.4 阶段四：后端 API 集成与注册（预计工作量：0.5天）
 
-#### 6.4.1 注册 Blueprint 到 Flask App
+#### 6.4.1 注册 Blueprint 到 Flask App ✅
 
 **目标**：在 `app.py` 中注册推荐 API
 
-```python
-# backend/app.py (示例修改)
+**实现状态**：✅ 已完成
 
+`backend/app.py` 第965-968行已完成Blueprint注册：
+
+```python
+# === 推荐功能模块 ===
 from routes.recommend import recommend_bp
 
-def create_app():
-    app = Flask(__name__)
-    app.config.from_object('config')
-
-    # 注册推荐 API Blueprint
-    app.register_blueprint(recommend_bp)
-
-    # ... 其他现有代码
-
-    return app
-
-if __name__ == '__main__':
-    app = create_app()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+app.register_blueprint(recommend_bp)
 ```
 
-#### 6.4.2 验证 API 可用性
+#### 6.4.2 验证 API 可用性 ✅
+
+**实现状态**：✅ 已实现
+
+已实现的 API 端点：
+
+| 方法 | 路径 | 功能 | 状态 |
+|------|------|------|------|
+| POST | `/api/recommend` | 文本推荐接口 | ✅ |
+| POST | `/api/recommend/feedback` | 提交推荐反馈 | ✅ |
+| GET | `/api/recommend/history` | 获取推荐历史 | ✅ |
+| GET | `/api/songs/<song_id>/features` | 获取歌曲特征 | ✅ |
+| POST | `/api/features/generate` | 批量生成歌曲特征 | ✅ |
+
+**验证命令**：
 
 ```bash
-# 启动后端服务
+# 1. 启动后端服务
 cd ~/code_project/music-project/backend
 ~/miniconda3/envs/music/bin/python app.py
 
-# 测试推荐接口
+# 2. 测试推荐接口（需要先有歌曲特征数据）
 curl -X POST http://localhost:5000/api/recommend \
   -H "Content-Type: application/json" \
   -d '{"query": "欢快的凯尔特音乐", "session_id": "test_001"}'
 
-# 测试反馈接口
+# 3. 测试反馈接口
 curl -X POST http://localhost:5000/api/recommend/feedback \
   -H "Content-Type: application/json" \
   -d '{"history_id": 1, "song_id": 1893728473, "feedback_type": "like"}'
 
-# 测试历史记录接口
+# 4. 测试历史记录接口
 curl "http://localhost:5000/api/recommend/history?session_id=test_001"
+
+# 5. 测试歌曲特征接口（如果特征已生成）
+curl http://localhost:5000/api/songs/1893728473/features
+
+# 6. 批量生成特征接口
+curl -X POST http://localhost:5000/api/features/generate \
+  -H "Content-Type: application/json" \
+  -d '{"batch_size": 50}'
 ```
 
 **阶段四测试措施**：
 
-| 测试项 | 验证方法 | 预期结果 |
-|--------|----------|----------|
-| 服务启动 | `~/miniconda3/envs/music/bin/python app.py` | 无报错，5000端口监听 |
-| 推荐接口 | `curl -X POST /api/recommend -d '{"query":"测试"}'` | 返回 JSON，包含 results 数组 |
-| 反馈接口 | `curl -X POST /api/recommend/feedback -d '{"history_id":1,"song_id":123}'` | 返回 `{"success": true}` |
-| 历史接口 | `curl "/api/recommend/history?session_id=test"` | 返回 JSON，包含 history 数组 |
-| 特征接口 | `curl /api/songs/1893728473/features` | 返回歌曲特征或 404（特征未生成） |
+| 测试项 | 验证方法 | 预期结果 | 状态 |
+|--------|----------|----------|------|
+| 服务启动 | `python app.py` | 无报错，5000端口监听 | ☐ |
+| 推荐接口 | `curl -X POST /api/recommend` | 返回 JSON，包含 results 数组 | ☐ |
+| 反馈接口 | `curl -X POST /api/recommend/feedback` | 返回 `{"success": true}` | ☐ |
+| 历史接口 | `curl "/api/recommend/history"` | 返回 JSON，包含 history 数组 | ☐ |
+| 特征接口 | `curl /api/songs/<id>/features` | 返回歌曲特征或 404（特征未生成） | ☐ |
+
+#### 6.4.3 依赖服务检查清单
+
+在调用推荐 API 前，需确认以下服务正常运行：
+
+| 服务 | 检查命令 | 预期结果 |
+|------|----------|----------|
+| PostgreSQL | `psql -h localhost -U postgres -d music_db -c "SELECT 1"` | 返回 `1` |
+| MongoDB | `mongosh --eval "db.adminCommand('ping')"` | 返回 `{ ok: 1 }` |
+| LLM API | 测试 `llm_service.py` 中的 chat 方法 | 返回正常响应 |
 
 ---
 
