@@ -2106,9 +2106,8 @@ src/
 |----------|------|------|
 | `src/api/recommend.ts` | 推荐 API 封装 | ☐ |
 | `src/stores/recommend.ts` | 推荐状态管理 | ☐ |
-| `src/components/AIRecommendEntry.vue` | AI推荐入口组件 | ☐ |
 | `src/components/RecommendCard.vue` | 推荐结果卡片 | ☐ |
-| `src/pages/recommend/recommend.vue` | 推荐页面 | ☐ |
+| `src/pages/recommend/recommend.vue` | AI 推荐页面 | ☐ |
 
 **pages.json 路由配置**（需新增）：
 
@@ -2119,21 +2118,9 @@ src/
     {
       "path": "pages/recommend/recommend",
       "style": {
-        "navigationBarTitleText": "AI 音乐推荐"
+        "navigationStyle": "custom",
+        "navigationBarBackgroundColor": "#1a1a2e"
       }
-    }
-  ],
-  "subPackages": [
-    {
-      "root": "pages/recommend",
-      "pages": [
-        {
-          "path": "recommend",
-          "style": {
-            "navigationBarTitleText": "AI 音乐推荐"
-          }
-        }
-      ]
     }
   ]
 }
@@ -2307,58 +2294,84 @@ export const useRecommendStore = defineStore('recommend', {
 })
 ```
 
-#### 6.5.5 推荐页面实现
+#### 6.5.5 推荐页面实现（聊天风格）
+
+**设计理念**：类似微信、飞书、Integram、Telegram 的聊天窗口风格
+- 整体宽度限制在 1200px 以内，与 App.vue 保持一致
+- 输入区域固定在底部，类似聊天输入框
+- 推荐结果以卡片列表形式展示，AI 回复风格
+- 无"搜索"按钮，发送仅通过回车或输入后自动触发
 
 **src/pages/recommend/recommend.vue**：
 
 ```vue
 <template>
   <view class="recommend-page">
-    <!-- 搜索输入区 -->
-    <view class="search-section">
-      <textarea
-        class="search-input"
-        v-model="queryText"
-        placeholder="请描述你想要的音乐...（如：欢快的凯尔特音乐）"
-        :disabled="store.loading"
-      />
-      <view class="search-actions">
-        <button
-          class="voice-btn"
-          @click="toggleVoiceInput"
-          :class="{ active: voiceInputActive }"
-        >
-          🎤 语音
-        </button>
-        <button
-          class="search-btn"
-          @click="handleSearch"
-          :disabled="!queryText.trim() || store.loading"
-        >
-          {{ store.loading ? '搜索中...' : '搜索' }}
-        </button>
+    <!-- 内容区域 -->
+    <scroll-view class="chat-container" scroll-y>
+      <!-- 欢迎提示 -->
+      <view class="welcome-tip" v-if="messages.length === 0">
+        <text class="welcome-icon">🎵</text>
+        <text class="welcome-text">告诉我你想听什么样的音乐</text>
+        <text class="welcome-hint">比如："欢快的凯尔特音乐"、"夜晚独自思考时听"</text>
       </view>
-    </view>
 
-    <!-- 推荐结果列表 -->
-    <view class="results-section" v-if="store.results.length > 0">
+      <!-- 消息列表 -->
       <view
-        v-for="item in store.results"
-        :key="item.song_id"
-        class="result-item"
+        v-for="(msg, index) in messages"
+        :key="index"
+        class="message-item"
+        :class="msg.type"
       >
-        <RecommendCard
-          :song="item"
-          :history-id="store.historyId"
-          @play="handlePlay"
-          @feedback="handleFeedback"
-        />
-      </view>
-    </view>
+        <!-- 用户消息 -->
+        <view v-if="msg.type === 'user'" class="user-message">
+          <text class="message-text">{{ msg.content }}</text>
+        </view>
 
-    <!-- 空状态 -->
-    <view class="empty-state" v-else-if="!store.loading && searched">
-      <text>未找到匹配的音乐，请尝试其他描述</text>
+        <!-- AI 推荐结果 -->
+        <view v-else-if="msg.type === 'ai'" class="ai-message">
+          <view class="ai-avatar">🤖</view>
+          <view class="ai-content">
+            <text class="ai-intro">根据您的描述，为您推荐以下音乐：</text>
+            <view class="results-list">
+              <view
+                v-for="item in msg.results"
+                :key="item.song_id"
+                class="result-card"
+              >
+                <RecommendCard
+                  :song="item"
+                  :history-id="store.historyId"
+                  @play="handlePlay"
+                  @feedback="handleFeedback"
+                />
+              </view>
+            </view>
+          </view>
+        </view>
+      </view>
+
+      <!-- 加载中 -->
+      <view class="loading-tip" v-if="store.loading">
+        <text>🤖 AI 正在分析并推荐...</text>
+      </view>
+    </scroll-view>
+
+    <!-- 底部输入区（聊天风格） -->
+    <view class="input-area">
+      <view class="input-wrapper">
+        <textarea
+          class="chat-input"
+          v-model="queryText"
+          placeholder="描述你想要音乐..."
+          :disabled="store.loading"
+          @confirm="handleSend"
+          confirm-type="send"
+        />
+        <view class="send-btn" @click="handleSend" v-if="queryText.trim()">
+          <text>发送</text>
+        </view>
+      </view>
     </view>
   </view>
 </template>
@@ -2368,105 +2381,188 @@ import { ref } from 'vue'
 import { useRecommendStore } from '@/stores/recommend'
 import { usePlayerStore } from '@/stores/player'
 import RecommendCard from '@/components/RecommendCard.vue'
+import type { RecommendSong } from '@/api/recommend'
+
+interface Message {
+  type: 'user' | 'ai'
+  content: string
+  results?: RecommendSong[]
+}
 
 const store = useRecommendStore()
 const playerStore = usePlayerStore()
 
 const queryText = ref('')
-const searched = ref(false)
-const voiceInputActive = ref(false)
+const messages = ref<Message[]>([])
 
-function handleSearch() {
-  if (!queryText.value.trim()) return
-  searched.value = true
-  store.recommend(queryText.value)
+// 发送消息
+async function handleSend() {
+  const text = queryText.value.trim()
+  if (!text || store.loading) return
+
+  // 添加用户消息
+  messages.value.push({ type: 'user', content: text })
+  queryText.value = ''
+
+  // 调用推荐
+  store.searched = true
+  await store.recommend(text)
+
+  // 添加 AI 回复
+  if (store.results.length > 0) {
+    messages.value.push({
+      type: 'ai',
+      content: '为您推荐',
+      results: store.results
+    })
+  }
 }
 
-function handlePlay(song: any) {
-  playerStore.playSong(song, store.results)
+function handlePlay(song: RecommendSong) {
+  playerStore.playSong(song as any, store.results as any)
 }
 
-function handleFeedback({ song, feedbackType }: { song: any; feedbackType: string }) {
+function handleFeedback({ song, feedbackType }: { song: RecommendSong; feedbackType: string }) {
   store.submitFeedback(song.song_id, feedbackType)
-}
-
-function toggleVoiceInput() {
-  // TODO: 实现语音输入
-  voiceInputActive.value = !voiceInputActive.value
 }
 </script>
 
 <style lang="scss" scoped>
 .recommend-page {
-  min-height: 100vh;
-  background: #1a1a2e;
-  padding: 20rpx;
-}
-
-.search-section {
-  padding: 30rpx;
-  background: rgba(255, 255, 255, 0.05);
-  border-radius: 16rpx;
-  margin-bottom: 20rpx;
-}
-
-.search-input {
-  width: 100%;
-  padding: 24rpx;
-  background: rgba(255, 255, 255, 0.1);
-  border: none;
-  border-radius: 12rpx;
-  color: #fff;
-  font-size: 28rpx;
-  min-height: 120rpx;
-  box-sizing: border-box;
-}
-
-.search-input::placeholder {
-  color: rgba(255, 255, 255, 0.5);
-}
-
-.search-actions {
   display: flex;
-  justify-content: space-between;
-  margin-top: 20rpx;
+  flex-direction: column;
+  height: 100vh;
+  max-width: 1200px;
+  margin: 0 auto;
+  background: #1a1a2e;
+}
+
+.chat-container {
+  flex: 1;
+  padding: 20rpx;
+  overflow-y: auto;
+}
+
+.welcome-tip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 100rpx 40rpx;
   gap: 16rpx;
 }
 
-.voice-btn,
-.search-btn {
-  padding: 16rpx 40rpx;
-  border: none;
-  border-radius: 40rpx;
-  font-size: 28rpx;
+.welcome-icon {
+  font-size: 80rpx;
+}
+
+.welcome-text {
+  font-size: 32rpx;
   color: #fff;
 }
 
-.voice-btn {
-  background: rgba(255, 255, 255, 0.1);
-  &.active {
-    background: linear-gradient(90deg, #00d4ff, #7b2cbf);
-  }
+.welcome-hint {
+  font-size: 26rpx;
+  color: rgba(255, 255, 255, 0.5);
+  text-align: center;
 }
 
-.search-btn {
+.message-item {
+  margin-bottom: 30rpx;
+}
+
+.user-message {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.user-message .message-text {
+  max-width: 70%;
+  padding: 20rpx 30rpx;
   background: linear-gradient(90deg, #00d4ff, #7b2cbf);
+  border-radius: 24rpx;
+  color: #fff;
+  font-size: 28rpx;
+}
+
+.ai-message {
+  display: flex;
+  gap: 16rpx;
+}
+
+.ai-avatar {
+  width: 64rpx;
+  height: 64rpx;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 32rpx;
+  flex-shrink: 0;
+}
+
+.ai-content {
   flex: 1;
 }
 
-.results-section {
+.ai-intro {
+  font-size: 26rpx;
+  color: rgba(255, 255, 255, 0.6);
+  margin-bottom: 16rpx;
+}
+
+.results-list {
   display: flex;
   flex-direction: column;
   gap: 16rpx;
 }
 
-.empty-state {
+.loading-tip {
   display: flex;
   justify-content: center;
-  align-items: center;
-  padding: 100rpx;
+  padding: 30rpx;
   color: rgba(255, 255, 255, 0.5);
+  font-size: 26rpx;
+}
+
+.input-area {
+  padding: 20rpx;
+  background: rgba(0, 0, 0, 0.2);
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.input-wrapper {
+  display: flex;
+  align-items: flex-end;
+  gap: 16rpx;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 40rpx;
+  padding: 16rpx 24rpx;
+}
+
+.chat-input {
+  flex: 1;
+  min-height: 48rpx;
+  max-height: 120rpx;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: #fff;
   font-size: 28rpx;
+  line-height: 1.4;
+}
+
+.chat-input::placeholder {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.send-btn {
+  padding: 12rpx 30rpx;
+  background: linear-gradient(90deg, #00d4ff, #7b2cbf);
+  border-radius: 30rpx;
+  color: #fff;
+  font-size: 26rpx;
+  flex-shrink: 0;
 }
 </style>
 ```
@@ -2644,15 +2740,14 @@ function onSkip() {
 </style>
 ```
 
-#### 6.5.7 AI 推荐入口
+#### 6.5.6 AI 推荐入口
 
 在首页 `src/pages/index/index.vue` 导航栏区域添加 AI 推荐入口：
 
 ```vue
-<!-- 在导航栏 nav 中添加 -->
+<!-- 在导航栏 nav 中添加，与"歌曲"、"分类"并列 -->
 <view
-  class="nav-btn"
-  :class="{ active: currentView === 'recommend' }"
+  class="nav-btn ai-recommend-btn"
   @click="goToRecommend"
 >AI推荐</view>
 ```
@@ -2663,6 +2758,16 @@ function goToRecommend() {
   uni.navigateTo({
     url: '/pages/recommend/recommend'
   })
+}
+```
+
+**样式**（在 `.nav-btn` 样式中添加）：
+
+```scss
+&.ai-recommend-btn {
+  background: linear-gradient(90deg, rgba(0, 212, 255, 0.4), rgba(123, 44, 191, 0.4));
+  color: #fff;
+  border: 1px solid rgba(0, 212, 255, 0.3);
 }
 ```
 
@@ -2824,7 +2929,7 @@ npm run build:mp-weixin
 | **阶段二** | 数据库设计与创建 | 1-2天 | 阶段一 | ✅ 已完成 |
 | **阶段三** | 后端核心功能开发 | 4-6天 | 阶段二 | ✅ 已完成 |
 | **阶段四** | 后端 API 集成 | 0.5天 | 阶段三 | ✅ 已完成 |
-| **阶段五** | 前端开发 | 3-4天 | 阶段四 | ✅ 设计文档已完成 |
+| **阶段五** | 前端开发 | 3-4天 | 阶段四 | ✅ 代码已完成 |
 | **阶段六** | 测试与部署 | 2-3天 | 阶段五 | ☐ 待开始 |
 
 **总预计工时：11.5 - 17.5 人天**
@@ -2832,10 +2937,9 @@ npm run build:mp-weixin
 **已完成里程碑**：
 - ✅ **M1（阶段二完成后）**：数据库设计评审通过
 - ✅ **M2（阶段四完成后）**：后端 API 可用
-- ✅ **M3（阶段五完成后）**：前端页面设计文档已完成
+- ✅ **M3（阶段五完成后）**：前端页面代码已完成
 
 **待完成里程碑**：
-- ☐ **M3'（阶段五实际完成后）**：前端页面可用
 - ☐ **M4（阶段六完成后）**：功能测试通过，可上线
 
 ---

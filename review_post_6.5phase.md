@@ -1,0 +1,2 @@
+6.5阶段的前端设计已经完成,我已经查看过. 需要修改的点, index.vue的修改,已经添加了 "AI推荐"的nav-btn, 与"歌曲","分类"并列,然后在下方又出现了AIRecommendEntry, 而这个是一个专门的vue视图, 我的看法是尽量简洁,不需要AIRecommendEntry,请删除这个, 包括src/components/AIRecommendEntry.vue,应该也不需要了. 第二点, 点击了"AI推荐"后,进入到页面src/pages/recommend/recommend.vue, 这个页面的风格需要与app.vue保持一致, 也就是需要有一个max-width=1200 类似于这样的限制. "搜索"按钮不需要, 因为会让人跟传统的搜索混淆.
+把这部分的页面设计成类似于微信,飞书, integram, telegram这样的聊天窗口的风格. 请帮我先修改设计文档design.md. 
