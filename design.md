@@ -1326,6 +1326,26 @@ LLM_MODEL_NAME = 'abab6.5s-chat'
    CREATE INDEX idx_feedback_completion ON recommendation_feedback(playback_completion_rate);
    ```
 
+> **⚠️ 重要说明：与原有 schema.sql 的关系**
+>
+> 本阶段新建的三个表（`music_features`、`recommendation_history`、`recommendation_feedback`）**独立于** `~/code_project/music-project/database/schema.sql` 中原有的表结构。
+>
+> - **原有项目**（`music-project/database/schema.sql`）：包含 `songs`、`playlists`、`artists`、`song_playlist`、`comments`、`male_artists`、`female_artists`、`artist_songs_relation`
+> - **本项目新增**（本章设计）：`music_features`、`recommendation_history`、`recommendation_feedback`
+>
+> 两套表结构**共存于同一个数据库**，通过 `song_id` 外键关联。本项目设计的新表**不会修改**原有项目中的 `schema.sql` 文件，以确保两项目的独立性。
+>
+> **创建方式**：已在本项目 `database/schema.sql` 中准备好完整的 CREATE TABLE 语句。在数据库中执行以下命令即可创建：
+> ```bash
+> psql -h localhost -U postgres -d music_db -f /home/luke/code_project/musicRecommend/database/schema.sql
+> ```
+> 详细步骤见 `database/readme.md`。
+>
+> **验证命令**：
+> ```sql
+> \dt music_features recommendation_history recommendation_feedback
+> ```
+
 5. **验证表创建成功**
    ```sql
    \dt music_features recommendation_history recommendation_feedback
