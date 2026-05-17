@@ -24,7 +24,7 @@
 
 ```bash
 # 1. 连接到数据库
-psql -h localhost -U postgres -d music_db
+psql -h localhost -U postgres -d musicdb
 
 # 2. 执行 schema.sql
 \i /home/luke/code_project/musicRecommend/database/schema.sql
