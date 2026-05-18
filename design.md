@@ -141,21 +141,66 @@
 songs (歌曲表)
     │
     ├── 1:N ─→ song_playlist (歌曲-歌单关联表)
-    │                 │
-    │                 └── N:1 ─→ playlists (歌单表)
+    │           │
+    │           └── N:1 ─→ playlists (歌单表)
     │
-    └── 1:N ─→ comments (评论表，MongoDB)
-
-songs (歌曲表)
+    ├── 1:1 ─→ song_playlist_agg (歌曲-歌单预聚合表) 【新增】
+    │           │
+    │           └── 预聚合了 songs + song_playlist + playlists 的结果
+    │
+    ├── 1:1 ─→ song_comment_agg (歌曲-评论预聚合表) 【新增】
+    │           │
+    │           └── 预聚合了 songs + MongoDB comments 的结果
     │
     └── 1:1 ─→ music_features (音乐特征表)
 ```
 
-##### 1.2.3.2 核心关联查询语句
+**设计原则**：
+- `song_playlist_agg` 和 `song_comment_agg` 是预处理表，避免实时 JOIN
+- 特征生成和推荐查询时，直接查询预聚合表，无需任何 JOIN 操作
 
-**查询1：获取歌曲的所有歌单名称**
+##### 1.2.3.2 核心查询语句（预聚合表）
+
+> **注意**：以下查询使用预聚合表，无需 JOIN，直接查询即可。
+
+**查询1：通过 song_playlist_agg 获取歌曲的所有歌单名称**
 ```sql
--- 获取指定歌曲所属的所有歌单
+-- 直接查询预聚合表（无需 JOIN）
+SELECT song_id, playlist_names, playlist_categories, playlist_count
+FROM song_playlist_agg
+WHERE song_id = 1893728473;
+```
+
+**查询2：通过 song_comment_agg 获取歌曲的所有评论**
+```sql
+-- 直接查询预聚合表（无需连接 MongoDB）
+SELECT song_id, comment_count, top_comments, comment_summary, avg_polarity
+FROM song_comment_agg
+WHERE song_id = 1893728473;
+```
+
+**查询3：获取歌曲的完整文本信息（供LLM特征提取用）**
+```sql
+-- 组合预聚合表获取完整信息（无需 JOIN）
+SELECT
+    s.song_id,
+    s.song_name,
+    s.artist,
+    s.album,
+    spa.playlist_names,           -- 来自 song_playlist_agg
+    spa.playlist_categories,
+    sca.top_comments,             -- 来自 song_comment_agg
+    sca.comment_summary
+FROM songs s
+LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
+LEFT JOIN song_comment_agg sca ON s.song_id = sca.song_id
+WHERE s.song_id = 1893728473;
+```
+
+**对比：实时 JOIN 查询（旧方式，已废弃）**
+```sql
+-- 以下查询已废弃，因性能问题不再使用
+-- 获取指定歌曲所属的所有歌单（需要 JOIN）
 SELECT s.song_id, s.song_name,
        ARRAY_AGG(p.playlist_name) AS playlist_names
 FROM songs s
@@ -165,56 +210,21 @@ WHERE s.song_id = 1893728473
 GROUP BY s.song_id, s.song_name;
 ```
 
-**查询2：获取歌曲的所有评论**
+**查询4：批量获取待提取特征的歌曲信息（使用预聚合表）**
 ```sql
--- 获取指定歌曲的用户评论（MongoDB）
-db.comments.find({ "song_id": 1893728473 }, { "content": 1, "sentiment": 1 })
-```
-
-**查询3：获取歌曲的完整文本信息（供LLM特征提取用）**
-```sql
--- 获取单首歌曲的完整信息（文本信息来源）
+-- 获取尚未生成特征的歌曲，批量处理（无需 JOIN）
 SELECT
     s.song_id,
     s.song_name,
     s.artist,
     s.album,
-    -- 聚合所有歌单名
-    COALESCE(
-        (SELECT ARRAY_AGG(p.playlist_name)
-         FROM song_playlist sp
-         JOIN playlists p ON sp.playlist_id = p.playlist_id
-         WHERE sp.song_id = s.song_id),
-        ARRAY[]::VARCHAR[]
-    ) AS playlist_names,
-    -- 聚合所有评论内容
-    COALESCE(
-        (SELECT ARRAY_AGG(c.content)
-         FROM comments c
-         WHERE c.song_id = s.song_id),
-        ARRAY[]::VARCHAR[]
-    ) AS comment_contents
-FROM songs s
-WHERE s.song_id = 1893728473;
-```
-
-**查询4：批量获取待提取特征的歌曲信息**
-```sql
--- 获取尚未生成特征的歌曲，批量处理
-SELECT
-    s.song_id,
-    s.song_name,
-    s.artist,
-    s.album,
-    ARRAY_AGG(DISTINCT p.playlist_name) AS playlist_names,
-    ARRAY_AGG(DISTINCT c.content) AS comment_summaries
+    spa.playlist_names,           -- 来自 song_playlist_agg
+    sca.top_comments              -- 来自 song_comment_agg
 FROM songs s
 LEFT JOIN music_features mf ON s.song_id = mf.song_id
-LEFT JOIN song_playlist sp ON s.song_id = sp.song_id
-LEFT JOIN playlists p ON sp.playlist_id = p.playlist_id
-LEFT JOIN comments c ON s.song_id = c.song_id
+LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
+LEFT JOIN song_comment_agg sca ON s.song_id = sca.song_id
 WHERE mf.id IS NULL  -- 尚未生成特征
-GROUP BY s.song_id, s.song_name, s.artist, s.album
 LIMIT 100;
 ```
 
@@ -225,9 +235,9 @@ LIMIT 100;
 | `songs.song_name` | 歌曲名中的情绪词、类型词 | 关键词匹配 | 直接获取 | 快速初筛 |
 | `songs.artist` | 艺术家类型（古典/流行/民族） | 映射表 | 直接获取 | 辅助分类 |
 | `songs.album` | 专辑风格 | 关键词匹配 | 直接获取 | 辅助分类 |
-| `playlists.playlist_name` | 场景、情绪、功能描述 | LLM提取 | 通过 `song_playlist` 关联获取 | 核心特征 |
-| `playlists.category` | 粗粒度分类 | 直接使用 | 通过 `song_playlist` 关联获取 | 快速过滤 |
-| `comments.content` | 用户描述的场景/情绪/感受 | LLM提取 | 通过 `song_id` 直接关联 | 情感增强 |
+| `song_playlist_agg.playlist_names` | 场景、情绪、功能描述 | LLM提取 | 直接查询（预聚合） | 核心特征 |
+| `song_playlist_agg.playlist_categories` | 粗粒度分类 | 直接使用 | 直接查询（预聚合） | 快速过滤 |
+| `song_comment_agg.top_comments` | 用户描述的场景/情绪/感受 | LLM提取 | 直接查询（预聚合） | 情感增强 |
 
 ---
 
@@ -266,6 +276,188 @@ LIMIT 100;
 ---
 
 ## 3. 数据库扩展设计
+
+### 3.0 预处理中间表设计原则
+
+**核心思想**：在用户发送查询前，提前将需要 JOIN 才能获取的信息准备好，使用时只需执行简单的单表查询，无需任何 JOIN 操作。
+
+**设计原则**：
+1. **预处理优于实时计算**：将复杂查询的结果预先存储到中间表
+2. **一次性写入，多次读取**：预计算表的写入成本高，但读取极快
+3. **可扩展性**：预留字段用于未来数据填充（如暂无评论的歌曲后续补充）
+4. **不污染原始表**：中间表独立存在，不修改 songs、playlists 等原始表结构
+
+**涉及场景**：
+- `songs` + `playlists`（通过 `song_playlist` 关联）的歌单名称聚合
+- `songs` + `comments`（MongoDB）的评论内容聚合
+
+---
+
+### 3.0.1 新增表：歌曲-歌单预聚合表 (song_playlist_agg)
+
+将 `songs` 通过 `song_playlist` 关联 `playlists` 的结果预先聚合存储。
+
+```sql
+CREATE TABLE song_playlist_agg (
+    id SERIAL PRIMARY KEY,
+    song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
+
+    -- 预聚合的歌单信息
+    playlist_names TEXT[],           -- 所有歌单名称的数组
+    playlist_categories TEXT[],      -- 所有歌单分类的数组
+    playlist_count INTEGER DEFAULT 0,  -- 歌单数量
+
+    -- 便于快速查询的字符串形式（可选，用于模糊匹配）
+    playlist_names_str VARCHAR(1000),  -- 逗号分隔的歌单名称
+    playlist_categories_str VARCHAR(500), -- 逗号分隔的分类
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 索引
+CREATE INDEX idx_song_playlist_agg_song_id ON song_playlist_agg(song_id);
+```
+
+**数据样例**：
+
+| song_id | playlist_names | playlist_categories | playlist_count |
+|---------|----------------|---------------------|-----------------|
+| 1893728473 | {宁静致远, 放松身心, 深夜独酌} | {古典, 深夜} | 3 |
+| 1457702766 | {凯尔特风情, 战斗音乐} | {凯尔特, 运动} | 2 |
+
+**预聚合脚本**（离线批量执行）：
+```python
+def rebuild_song_playlist_agg():
+    """重建歌曲-歌单预聚合表（离线批量执行）"""
+    cursor.execute("TRUNCATE song_playlist_agg RESTART IDENTITY")
+
+    cursor.execute("""
+        INSERT INTO song_playlist_agg (
+            song_id, playlist_names, playlist_categories,
+            playlist_count, playlist_names_str, playlist_categories_str
+        )
+        SELECT
+            s.song_id,
+            ARRAY_AGG(DISTINCT p.playlist_name) FILTER (WHERE p.playlist_name IS NOT NULL),
+            ARRAY_AGG(DISTINCT p.category) FILTER (WHERE p.category IS NOT NULL),
+            COUNT(DISTINCT sp.playlist_id),
+            STRING_AGG(DISTINCT p.playlist_name, ', ') FILTER (WHERE p.playlist_name IS NOT NULL),
+            STRING_AGG(DISTINCT p.category, ', ') FILTER (WHERE p.category IS NOT NULL)
+        FROM songs s
+        LEFT JOIN song_playlist sp ON s.song_id = sp.song_id
+        LEFT JOIN playlists p ON sp.playlist_id = p.playlist_id
+        GROUP BY s.song_id
+    """)
+```
+
+**使用场景**：
+- 特征生成时，获取歌曲的歌单信息：直接 `SELECT * FROM song_playlist_agg WHERE song_id = ?`
+- 推荐时，快速获取候选歌曲的上下文：JOIN `music_features` 时无需再 JOIN `song_playlist`
+
+---
+
+### 3.0.2 新增表：歌曲-评论预聚合表 (song_comment_agg)
+
+将 `songs` 在 MongoDB 中的评论信息预先聚合存储（可选，但建议实现）。
+
+```sql
+CREATE TABLE song_comment_agg (
+    id SERIAL PRIMARY KEY,
+    song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
+
+    -- 预聚合的评论信息
+    comment_count INTEGER DEFAULT 0,       -- 评论总数
+    top_comments TEXT[],                   -- 点赞最高的评论（最多5条）
+    comment_summary TEXT,                  -- 评论内容摘要（供LLM使用）
+
+    -- 情感统计
+    positive_count INTEGER DEFAULT 0,
+    neutral_count INTEGER DEFAULT 0,
+    negative_count INTEGER DEFAULT 0,
+    avg_polarity DECIMAL(3,2),             -- 平均情感极性
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 索引
+CREATE INDEX idx_song_comment_agg_song_id ON song_comment_agg(song_id);
+```
+
+**数据样例**：
+
+| song_id | comment_count | top_comments | avg_polarity |
+|---------|---------------|--------------|--------------|
+| 1893728473 | 1523 | {这曲子太美了..., 战斗进行曲...} | 0.72 |
+
+**预聚合脚本**（定期从 MongoDB 同步）：
+```python
+def rebuild_song_comment_agg():
+    """从 MongoDB 重建歌曲-评论预聚合表（离线批量执行）"""
+    from pymongo import MongoClient
+
+    client = MongoClient(host=os.getenv('MONGO_HOST'), port=int(os.getenv('MONGO_PORT')))
+    db = client[os.getenv('MONGO_DB')]
+
+    cursor.execute("TRUNCATE song_comment_agg RESTART IDENTITY")
+
+    # 获取所有不同的 song_id
+    song_ids = db.comments.distinct('song_id')
+
+    for song_id in song_ids:
+        comments = list(db.comments.find(
+            {'song_id': song_id},
+            {'content': 1, 'sentiment': 1, 'polarity': 1, 'likedCount': 1}
+        ).sort('likedCount', -1).limit(5))
+
+        if not comments:
+            continue
+
+        # 聚合数据
+        top_comments = [c['content'][:200] for c in comments]
+        sentiments = [c.get('sentiment', 'neutral') for c in comments]
+        polarities = [c.get('polarity', 0) for c in comments]
+
+        positive_count = sentiments.count('positive')
+        neutral_count = sentiments.count('neutral')
+        negative_count = sentiments.count('negative')
+
+        cursor.execute("""
+            INSERT INTO song_comment_agg (
+                song_id, comment_count, top_comments, comment_summary,
+                positive_count, neutral_count, negative_count, avg_polarity
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            song_id, len(comments), top_comments, '; '.join(top_comments),
+            positive_count, neutral_count, negative_count,
+            sum(polarities) / len(polarities) if polarities else 0
+        ))
+
+    client.close()
+```
+
+---
+
+### 3.0.3 预计算表 vs 实时查询对比
+
+| 查询场景 | 实时查询（优化前） | 预计算表（优化后） |
+|----------|-------------------|-------------------|
+| 获取某歌曲的所有歌单 | `JOIN song_playlist + GROUP BY` (~500ms+) | `SELECT FROM song_playlist_agg` (~1ms) |
+| 获取某歌曲的评论摘要 | MongoDB 查询 (~10ms+) | `SELECT FROM song_comment_agg` (~1ms) |
+| 批量获取100首歌曲的歌单 | 100 × JOIN 查询 | 1 次批量查询 |
+
+**性能提升**：预处理后，特征生成时的数据获取时间可从 **14秒+ 降至 <1秒**。
+
+---
+
+### 3.0.4 数据更新策略
+
+1. **新增歌曲**：入库时自动写入 `song_playlist_agg`（通过触发器或应用层逻辑）
+2. **歌单变更**：歌曲被加入/移除歌单时，更新对应 `song_playlist_agg` 记录
+3. **评论更新**：定期（如每天）运行 `rebuild_song_comment_agg` 增量同步
+
+---
 
 ### 3.1 新增表：音乐特征表 (music_features)
 
@@ -2039,15 +2231,15 @@ PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FRO
 
 **步骤5：批量生成剩余歌曲特征**
 ```bash
-# 生成剩余约 50万（有评论的歌曲）
-# 以下命令需要约 25-40 分钟完成
+# 生成剩余约 12万（有评论的歌曲）
+# 以下命令需要约 6-10 分钟完成
 
-for i in {1..500}; do
-  echo "Batch $i/500 started at $(date)"
+for i in {1..124}; do
+  echo "Batch $i/124 started at $(date)"
   curl -s -X POST http://localhost:5000/api/features/generate \
     -H "Content-Type: application/json" \
     -d '{"batch_size": 1000}' > /dev/null
-  echo "Batch $i/500 completed at $(date)"
+  echo "Batch $i/124 completed at $(date)"
   sleep 1
 done
 
@@ -2056,7 +2248,7 @@ echo "特征生成完成！"
 
 **步骤6：最终验证**
 ```bash
-# 检查 music_features 表记录数（预期：50万-70万）
+# 检查 music_features 表记录数（预期：约 12.4万）
 PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
 
 # 检查特征分布
@@ -2074,8 +2266,8 @@ LIMIT 10;
 
 | 数据源 | 数量 | 说明 |
 |--------|------|------|
-| songs 表 | ~121万 | 歌曲总数 |
-| 有评论的歌曲 | ~50万 | 部分歌曲有评论 |
+| songs 表 | 1,216,466 | 歌曲总数 |
+| 有评论的歌曲 | 123,698 | 约 10% 的歌曲有评论（约 7028 万条评论） |
 | music_features 表 | 0 | 初始为空，需要填充 |
 
 ##### 批量生成特征命令
@@ -2091,19 +2283,19 @@ curl -X POST http://localhost:5000/api/features/generate \
 
 | 歌曲数量 | batch_size | 调用次数 | 预计总耗时 |
 |----------|------------|----------|------------|
-| 50万（有评论） | 1000 | 500次 | ~25-40分钟 |
-| 70万（无评论） | 1000 | 700次 | ~35-55分钟（特征质量略低） |
+| 12.4万（有评论） | 1000 | 124次 | ~6-10分钟 |
+| 约109万（无评论） | 1000 | 1090次 | ~55-90分钟（特征质量略低） |
 
 **建议**：
-1. 优先处理有评论的50万歌曲（质量更好）
+1. 优先处理有评论的 12.4万 歌曲（质量更好）
 2. 无评论的歌曲可先生成基础特征，后续有评论时再更新
 
 ##### 执行策略
 
 **方案A：一次性生成（推荐用于首次部署）**
 ```bash
-# 生成前50万有评论的歌曲特征
-for i in {1..500}; do
+# 生成前12.4万有评论的歌曲特征
+for i in {1..124}; do
   curl -s -X POST http://localhost:5000/api/features/generate \
     -H "Content-Type: application/json" \
     -d '{"batch_size": 1000}' | tee -a generate_log.txt

@@ -604,8 +604,11 @@ def build_response(self, query: str, query_type: str,
 | 表名 | 数据库类型 | 用途 |
 |------|-----------|------|
 | `songs` | PostgreSQL | 存储歌曲基本信息（song_id, song_name, artist, album, music_file） |
+| `song_playlist_agg` | PostgreSQL | 【预聚合表】存储每首歌曲关联的所有歌单名称和分类 |
+| `song_comment_agg` | PostgreSQL | 【预聚合表】存储每首歌曲的评论摘要和情感统计 |
 | `music_features` | PostgreSQL | 存储歌曲特征（genre, mood, scene, instruments 等） |
 | `recommendation_history` | PostgreSQL | 存储推荐历史记录 |
+| `comments` | MongoDB | 原始评论数据（已被 song_comment_agg 预聚合） |
 
 ### 3.2 表结构
 
@@ -619,6 +622,38 @@ CREATE TABLE songs (
     album VARCHAR(255),
     music_file VARCHAR(255),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+#### song_playlist_agg 表（预聚合表）
+```sql
+CREATE TABLE song_playlist_agg (
+    id SERIAL PRIMARY KEY,
+    song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
+    playlist_names TEXT[],           -- 所有歌单名称的数组
+    playlist_categories TEXT[],      -- 所有歌单分类的数组
+    playlist_count INTEGER DEFAULT 0,
+    playlist_names_str VARCHAR(1000), -- 逗号分隔形式
+    playlist_categories_str VARCHAR(500),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+#### song_comment_agg 表（预聚合表）
+```sql
+CREATE TABLE song_comment_agg (
+    id SERIAL PRIMARY KEY,
+    song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
+    comment_count INTEGER DEFAULT 0,
+    top_comments TEXT[],             -- 点赞最高的评论（最多5条）
+    comment_summary TEXT,            -- 评论内容摘要
+    positive_count INTEGER DEFAULT 0,
+    neutral_count INTEGER DEFAULT 0,
+    negative_count INTEGER DEFAULT 0,
+    avg_polarity DECIMAL(3,2),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
