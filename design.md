@@ -2003,6 +2003,160 @@ def get_db_cursor():
 | recommend_bp 导入 | `~/miniconda3/envs/music/bin/python -c "from routes.recommend import recommend_bp; print('OK')"` | 输出 OK，无报错 |
 | 模块依赖链 | 创建测试脚本实例化 RecommendService | 无 ImportError |
 
+#### 6.3.6 特征数据生成执行说明（必做）
+
+**⚠️ 重要：此步骤必须在进入阶段六测试前完成**
+
+##### 第一次生成特征（完整步骤）
+
+**步骤1：确认后端服务正在运行**
+```bash
+curl http://localhost:5000/
+# 应返回 {"message":"音乐API服务正在运行","version":"1.0.0"}
+```
+
+**步骤2：确认 music_features 表为空**
+```bash
+PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
+# 预期结果：0
+```
+
+**步骤3：执行第一次批量生成**
+```bash
+# 生成第一批 1000 条（验证接口是否正常工作）
+curl -X POST http://localhost:5000/api/features/generate \
+  -H "Content-Type: application/json" \
+  -d '{"batch_size": 1000}'
+
+# 等待约 1-2 分钟（LLM 调用需要时间）
+```
+
+**步骤4：验证第一批生成成功**
+```bash
+PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
+# 预期结果：1000 或接近 1000（部分可能失败）
+```
+
+**步骤5：批量生成剩余歌曲特征**
+```bash
+# 生成剩余约 50万（有评论的歌曲）
+# 以下命令需要约 25-40 分钟完成
+
+for i in {1..500}; do
+  echo "Batch $i/500 started at $(date)"
+  curl -s -X POST http://localhost:5000/api/features/generate \
+    -H "Content-Type: application/json" \
+    -d '{"batch_size": 1000}' > /dev/null
+  echo "Batch $i/500 completed at $(date)"
+  sleep 1
+done
+
+echo "特征生成完成！"
+```
+
+**步骤6：最终验证**
+```bash
+# 检查 music_features 表记录数（预期：50万-70万）
+PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
+
+# 检查特征分布
+PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "
+SELECT genre, COUNT(*)
+FROM music_features
+WHERE genre IS NOT NULL AND genre != ''
+GROUP BY genre
+ORDER BY COUNT(*) DESC
+LIMIT 10;
+"
+```
+
+##### 当前数据状态
+
+| 数据源 | 数量 | 说明 |
+|--------|------|------|
+| songs 表 | ~121万 | 歌曲总数 |
+| 有评论的歌曲 | ~50万 | 部分歌曲有评论 |
+| music_features 表 | 0 | 初始为空，需要填充 |
+
+##### 批量生成特征命令
+
+```bash
+# 单次生成 1000 条（每条约 3-5 秒 LLM 调用时间）
+curl -X POST http://localhost:5000/api/features/generate \
+  -H "Content-Type: application/json" \
+  -d '{"batch_size": 1000}'
+```
+
+##### 预计耗时计算
+
+| 歌曲数量 | batch_size | 调用次数 | 预计总耗时 |
+|----------|------------|----------|------------|
+| 50万（有评论） | 1000 | 500次 | ~25-40分钟 |
+| 70万（无评论） | 1000 | 700次 | ~35-55分钟（特征质量略低） |
+
+**建议**：
+1. 优先处理有评论的50万歌曲（质量更好）
+2. 无评论的歌曲可先生成基础特征，后续有评论时再更新
+
+##### 执行策略
+
+**方案A：一次性生成（推荐用于首次部署）**
+```bash
+# 生成前50万有评论的歌曲特征
+for i in {1..500}; do
+  curl -s -X POST http://localhost:5000/api/features/generate \
+    -H "Content-Type: application/json" \
+    -d '{"batch_size": 1000}' | tee -a generate_log.txt
+  sleep 1  # 避免请求过于密集
+done
+
+# 检查生成结果
+PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
+```
+
+**方案B：分批执行，监控进度**
+```bash
+# 每批生成后检查进度
+PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "
+SELECT
+  COUNT(*) as total_generated,
+  COUNT(CASE WHEN description != '特征提取失败' THEN 1 END) as success_count
+FROM music_features;
+"
+```
+
+##### 后续扩展：新增歌曲和新评论
+
+**新增歌曲处理**：
+- `get_songs_without_features()` 会自动查询 `WHERE mf.id IS NULL`
+- 每次调用 `/api/features/generate` 时会自动补充新歌曲
+- **无需额外操作**，定时调用即可
+
+**新评论更新特征**：
+当歌曲新增评论后，可重新生成特征：
+```bash
+# 为指定 song_id 重新生成特征（会更新原有记录）
+curl -X POST http://localhost:5000/api/features/regenerate \
+  -H "Content-Type: application/json" \
+  -d '{"song_id": 123456}'
+```
+
+##### 验证特征生成成功
+
+```bash
+# 检查 music_features 表记录数
+PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
+
+# 检查特征分布
+PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "
+SELECT genre, COUNT(*)
+FROM music_features
+GROUP BY genre
+ORDER BY COUNT(*) DESC
+LIMIT 10;
+"
+```
+
 ---
 
 ### 6.4 阶段四：后端 API 集成与注册（预计工作量：0.5天）
