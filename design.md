@@ -568,6 +568,34 @@ class LLMService:
 阶段2：对关键歌曲（高播放量、高评论）使用云端模型重新生成
 ```
 
+**3.4 使用独立脚本填充（最简单的方式）**
+
+提供了独立脚本 `scripts/init_music_feature.py`，无需启动后端服务，可直接执行填充。
+
+```bash
+cd /home/luke/code_project/musicRecommend
+~/miniconda3/envs/music/bin/python scripts/init_music_feature.py
+```
+
+**脚本工作流程：**
+1. 从 `song_playlist_agg` 和 `song_comment_agg` 预聚合表读取歌曲信息（无需实时 JOIN）
+2. 逐首调用 LLM 生成特征（使用环境变量中的 `LLM_PROVIDER_KEY`、`LLM_PROVIDER_URL`、`LLM_MODEL_NAME`）
+3. 将特征 upsert 到 `music_features` 表
+4. 每处理 100 首输出一次进度
+
+**环境变量配置（通过 `~/.env` 或后端 `.env`）：**
+| 变量名 | 说明 | 示例 |
+|--------|------|------|
+| `LLM_PROVIDER_KEY` | API 密钥 | `your-api-key` |
+| `LLM_PROVIDER_URL` | API 地址 | `https://api.minimax.io/v1` |
+| `LLM_MODEL_NAME` | 模型名称 | `MiniMax-M2.7` |
+
+**进度查询：**
+```bash
+# 检查已填充的记录数
+PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
+```
+
 ---
 
 ### 3.1 新增表：音乐特征表 (music_features)
