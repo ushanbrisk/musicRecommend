@@ -93,14 +93,63 @@ def build_feature_prompt(song_info: dict) -> str:
 """
 
 
+def build_batch_feature_prompt(songs: list) -> str:
+    """构建批量歌曲特征提取 Prompt"""
+    songs_context = []
+    for i, song in enumerate(songs):
+        playlist_str = song.get('playlist_names_str', '') or '无'
+        comments_str = song.get('comment_summary', '') or '暂无评论'
+
+        songs_context.append(f"""### 歌曲 {i+1}
+- 歌曲ID：{song['song_id']}
+- 歌曲名称：{song['song_name']}
+- 艺术家：{song['artist']}
+- 专辑：{song.get('album', '未知')}
+- 归属歌单：{playlist_str}
+- 用户评论摘要：{comments_str}
+- 平均情感极性：{song.get('avg_polarity', 0)}
+""")
+
+    return f"""请为以下 {len(songs)} 首歌曲分别提取特征标签。
+
+{chr(10).join(songs_context)}
+
+请为每首歌曲生成独立的特征（JSON数组格式返回）：
+[
+  {{
+    "song_id": "歌曲ID（必填）",
+    "genre": "流派/风格，如：古典、流行、凯尔特、电子、爵士等",
+    "mood": "情绪标签（最多5个，用逗号分隔）",
+    "tempo": "节拍：快/中/慢",
+    "instruments": "主要乐器（最多3个，用逗号分隔）",
+    "scene": "适用场景（最多5个，用逗号分隔）",
+    "language": "歌曲语言：中文、英文、日文、纯音乐等",
+    "era": "时代/年代",
+    "description": "100字左右的歌曲描述",
+    "emotional_tags": "细腻情感标签（用逗号分隔）",
+    "theme_keywords": "主题关键词（逗号分隔）"
+  }},
+  ...
+]
+
+注意：
+1. 每首歌必须独立返回，所有字段都必须填写
+2. 一首歌可能属于多个歌单，歌单名传递了不同场景/情绪的语义
+3. 用户评论能反映真实感受，优先从评论中提取情绪和场景信息
+4. 仅基于文本信息推断，不要假设未知信息
+5. 返回有效的JSON数组，不要包含其他文字
+"""
+
+
 def extract_features(song_info: dict, llm_client, model_name: str) -> dict:
-    """调用 LLM 提取歌曲特征"""
+    """调用 LLM 提取歌曲特征（单首）"""
     prompt = build_feature_prompt(song_info)
 
     response = llm_client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
+        temperature=0.7,
+        timeout=120
     )
 
     try:
@@ -120,6 +169,41 @@ def extract_features(song_info: dict, llm_client, model_name: str) -> dict:
         }
 
     return features
+
+
+def extract_features_batch(songs: list, llm_client, model_name: str) -> list:
+    """批量调用 LLM 提取歌曲特征"""
+    prompt = build_batch_feature_prompt(songs)
+
+    response = llm_client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+        timeout=300
+    )
+
+    try:
+        content = response.choices[0].message.content.strip()
+
+        # 去掉 <think>...</think> 思考标签
+        if "<think>" in content:
+            content = content.split("</think>")[-1].strip()
+
+        # 去掉 ```json ... ``` 包裹
+        if content.startswith("```"):
+            lines = content.split("\n")
+            content = "\n".join(lines[1:-1])
+
+        features_list = json.loads(content)
+        if isinstance(features_list, list):
+            return features_list
+        else:
+            print(f"      警告: 返回格式不是数组: {type(features_list)}")
+            return []
+    except json.JSONDecodeError as e:
+        print(f"      警告: JSON解析失败: {e}")
+        print(f"      原始返回: {content[:500]}...")
+        return []
 
 
 def get_songs_without_features(cursor, limit: int = 100):
@@ -143,7 +227,7 @@ def get_songs_without_features(cursor, limit: int = 100):
           AND (
               -- 只处理有歌单或评论数据的歌曲
               spa.song_id IS NOT NULL
-              OR sca.song_id IS NOT NULL
+              AND sca.song_id IS NOT NULL
           )
         LIMIT %s
     """
@@ -232,7 +316,7 @@ def init_music_feature():
             LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
             LEFT JOIN song_comment_agg sca ON s.song_id = sca.song_id
             WHERE mf.id IS NULL
-              AND (spa.song_id IS NOT NULL OR sca.song_id IS NOT NULL)
+              AND (spa.song_id IS NOT NULL AND sca.song_id IS NOT NULL)
         """)
         remaining = cursor.fetchone()[0]
         print(f"      待处理歌曲数: {remaining:,}")
@@ -242,9 +326,10 @@ def init_music_feature():
             return
 
         # 3. 分批处理
-        print(f"\n[3/4] 开始填充数据（每批 50 首）...")
+        batch_size = int(os.getenv('BATCH_SIZE', '1'))  # 默认每批20首
+        print(f"\n[3/4] 开始填充数据（每批 {batch_size} 首）...")
         print(f"      使用 LLM 模型: {model_name}")
-        batch_size = 50
+
         total_processed = 0
         success_count = 0
         fail_count = 0
@@ -258,33 +343,68 @@ def init_music_feature():
             batch_num = total_processed // batch_size + 1
             print(f"\n  处理批次 {batch_num} ({len(songs)} 首)...")
 
-            for song in songs:
-                try:
-                    features = extract_features(song, llm_client, model_name)
-                    features['song_id'] = song['song_id']
+            try:
+                # 批量调用 LLM
+                features_list = extract_features_batch(songs, llm_client, model_name)
 
-                    # 构建 inherited_tags 从歌单继承
-                    inherited = []
-                    if song.get('playlist_categories_str'):
-                        inherited.append(f"来自歌单分类: {song['playlist_categories_str']}")
-                    features['inherited_tags'] = '; '.join(inherited)
+                if not features_list:
+                    # 批量调用失败，回退到逐首处理
+                    print(f"      批量调用失败，回退到逐首处理...")
+                    for song in songs:
+                        try:
+                            features = extract_features(song, llm_client, model_name)
+                            features['song_id'] = song['song_id']
 
-                    save_feature(features, cursor)
-                    success_count += 1
+                            # 构建 inherited_tags
+                            inherited = []
+                            if song.get('playlist_categories_str'):
+                                inherited.append(f"来自歌单分类: {song['playlist_categories_str']}")
+                            features['inherited_tags'] = '; '.join(inherited)
 
-                    if success_count % 100 == 0:
-                        conn.commit()
-                        elapsed = time.time() - start_time
-                        rate = success_count / elapsed if elapsed > 0 else 0
-                        print(f"      已处理: {success_count}/{remaining} ({rate:.1f} 首/秒)")
+                            save_feature(features, cursor)
+                            success_count += 1
+                        except Exception as e:
+                            fail_count += 1
+                            print(f"      ❌ song_id={song['song_id']}: {e}")
+                        total_processed += 1
+                else:
+                    # 成功处理批量返回的特征
+                    for features in features_list:
+                        try:
+                            # 找到对应的歌曲信息
+                            song = next((s for s in songs if str(s['song_id']) == str(features.get('song_id'))), None)
+                            if not song:
+                                print(f"      ⚠️ 无法匹配 song_id: {features.get('song_id')}")
+                                continue
 
-                except Exception as e:
-                    fail_count += 1
-                    print(f"      ❌ song_id={song['song_id']}: {e}")
+                            # 构建 inherited_tags
+                            inherited = []
+                            if song.get('playlist_categories_str'):
+                                inherited.append(f"来自歌单分类: {song['playlist_categories_str']}")
+                            features['inherited_tags'] = '; '.join(inherited)
 
-                total_processed += 1
+                            # 确保 song_id 存在
+                            features['song_id'] = song['song_id']
 
-            conn.commit()
+                            save_feature(features, cursor)
+                            success_count += 1
+                        except Exception as e:
+                            fail_count += 1
+                            print(f"      ❌ song_id={features.get('song_id')}: {e}")
+
+                        total_processed += 1
+
+                conn.commit()
+
+                if success_count % 100 == 0:
+                    elapsed = time.time() - start_time
+                    rate = success_count / elapsed if elapsed > 0 else 0
+                    print(f"      已处理: {success_count}/{remaining} ({rate:.1f} 首/秒)")
+
+            except Exception as e:
+                fail_count += len(songs)
+                print(f"      ❌ 批次处理失败: {e}")
+                conn.rollback()
 
         elapsed = time.time() - start_time
 
