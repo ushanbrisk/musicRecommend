@@ -792,18 +792,29 @@ LIMIT 5;
 
 > **重要**：完成 `song_playlist_agg` 和 `song_comment_agg` 的生成后，才能开始生成 `music_features`。
 
-**LLM 选择说明（速度 vs 质量）**：
+**方式一：使用脚本填充（推荐）**
 
-| LLM 选项 | 速度 | 质量 | 适用场景 |
-|----------|------|------|----------|
-| **MiniMax API（云端）** | ~15-20秒/首 | 高 | 首次大规模生成，推荐使用 |
-| **本地模型（如 Qwen、ChatGLM）** | ~3-5秒/首 | 中 | 小规模或频繁更新场景 |
-| **本地 Embedding + 规则** | ~0.1秒/首 | 低 | 快速但质量较低的占位方案 |
-
-**3.1 MiniMax API 生成（高质量，推荐首次使用）**
+脚本已放置在 `scripts/init_music_feature.py`，它会：
+1. 从 `song_playlist_agg` 和 `song_comment_agg` 预聚合表获取歌曲信息（无需实时 JOIN）
+2. 调用 LLM 为每首歌曲生成特征
+3. 将特征存储到 `music_features` 表
 
 ```bash
-# 批量生成特征（约 12.4 万首有评论的歌曲）
+# 执行填充脚本
+cd /home/luke/code_project/musicRecommend
+~/miniconda3/envs/music/bin/python scripts/init_music_feature.py
+```
+
+**方式二：使用 API 批量调用**
+
+如选择通过 API 批量调用，需要先确保后端服务运行：
+
+```bash
+# 启动后端服务（如未启动）
+cd /home/luke/code_project/music-project/backend
+~/miniconda3/envs/music/bin/python app.py &
+
+# 等待服务启动后，批量生成特征
 for i in {1..124}; do
   echo "Batch $i/124 started at $(date)"
   curl -s -X POST http://localhost:5000/api/features/generate \
@@ -815,49 +826,6 @@ done
 
 # 检查生成进度
 PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
-```
-
-**预计耗时**：约 6-10 分钟（124 次 × 3-5 秒/次 + 网络延迟）
-
-**3.2 本地模型生成（快速，但质量较低）**
-
-如果选择本地模型（如 Qwen2-7B），需要修改 `llm_service.py` 中的配置：
-
-```python
-# backend/services/llm_service.py
-
-class LLMService:
-    def __init__(self):
-        # 选择 1: MiniMax API（质量高，速度慢）
-        # self.client = OpenAI(
-        #     api_key=os.getenv("LLM_PROVIDER_KEY"),
-        #     base_url=os.getenv("LLM_PROVIDER_URL")
-        # )
-        # self.model = os.getenv("LLM_MODEL_NAME", "MiniMax-M2.7")
-
-        # 选择 2: 本地模型（速度快，质量中）
-        self.client = OpenAI(
-            api_key="local",
-            base_url="http://localhost:11434/v1"  # Ollama 默认地址
-        )
-        self.model = "qwen2:7b"  # 或其他本地模型
-
-        # 选择 3: 基于 Embedding 的快速方案（速度极快，质量低）
-        # self.embedding_model = "text-embedding-ada-002"
-```
-
-**本地模型优缺点**：
-- ✅ 速度快（3-5秒/首 vs 15-20秒/首）
-- ✅ 无需网络调用
-- ✅ 可离线运行
-- ❌ 质量较低，特征提取可能不够准确
-- ❌ 需要本地部署 LLM（Ollama 或其他）
-
-**3.3 混合方案（推荐用于生产环境）**
-
-```
-阶段1：使用本地快速模型生成基础特征
-阶段2：对关键歌曲（高播放量、高评论）使用云端模型重新生成
 ```
 
 ---
