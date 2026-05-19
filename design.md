@@ -445,6 +445,19 @@ LIMIT 100;
 
 ---
 
+#### Step 1：创建 song_playlist_agg 表
+
+**1.1 创建表**
+
+执行 `database/schema.sql` 中的建表语句。
+
+**1.2 填充数据（从 PostgreSQL 聚合）**
+
+```bash
+cd /home/luke/code_project/musicRecommend
+~/miniconda3/envs/music/bin/python scripts/init_song_playlist_agg.py
+```
+
 **预期结果**：
 - 生成约 121 万条记录（与 songs 表行数相同）
 - 执行时间：约 5-15 分钟（取决于数据量）
@@ -472,7 +485,14 @@ LIMIT 5;
 
 **2.1 创建表**
 
+执行 `database/schema.sql` 中的建表语句。
+
 **2.2 填充数据（从 MongoDB 同步）**
+
+```bash
+cd /home/luke/code_project/musicRecommend
+~/miniconda3/envs/music/bin/python scripts/init_song_comment_agg.py
+```
 
 **预期结果**：
 - 生成约 12.4 万条记录（与有评论的歌曲数相同）
@@ -508,7 +528,7 @@ LIMIT 5;
 | **本地模型（如 Qwen、ChatGLM）** | ~3-5秒/首 | 中 | 小规模或频繁更新场景 |
 | **本地 Embedding + 规则** | ~0.1秒/首 | 低 | 快速但质量较低的占位方案 |
 
-**3.1 MiniMax API 生成（高质量，推荐首次使用）**
+**MiniMax API 生成（高质量，推荐首次使用）**
 
 ```bash
 # 批量生成特征（约 12.4 万首有评论的歌曲）
@@ -527,7 +547,7 @@ PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FRO
 
 **预计耗时**：约 6-10 分钟（124 次 × 3-5 秒/次 + 网络延迟）
 
-**3.2 本地模型生成（快速，但质量较低）**
+**本地模型生成（快速，但质量较低）**
 
 如果选择本地模型（如 Qwen2-7B），需要修改 `llm_service.py` 中的配置：
 
@@ -561,14 +581,14 @@ class LLMService:
 - ❌ 质量较低，特征提取可能不够准确
 - ❌ 需要本地部署 LLM（Ollama 或其他）
 
-**3.3 混合方案（推荐用于生产环境）**
+**混合方案（推荐用于生产环境）**
 
 ```
 阶段1：使用本地快速模型生成基础特征
 阶段2：对关键歌曲（高播放量、高评论）使用云端模型重新生成
 ```
 
-**3.4 使用独立脚本填充（最简单的方式）**
+**使用独立脚本填充（最简单的方式）**
 
 提供了独立脚本 `scripts/init_music_feature.py`，无需启动后端服务，可直接执行填充。
 
@@ -3263,7 +3283,7 @@ function onSkip() {
 </style>
 ```
 
-#### 6.5.6 AI 推荐入口
+#### 6.5.7 AI 推荐入口
 
 在首页 `src/pages/index/index.vue` 导航栏区域添加 AI 推荐入口：
 
