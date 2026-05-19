@@ -303,28 +303,6 @@ LIMIT 100;
 > ```
 > 详细步骤见 **6.2.1 节**。
 
-```sql
-CREATE TABLE song_playlist_agg (
-    id SERIAL PRIMARY KEY,
-    song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
-
-    -- 预聚合的歌单信息
-    playlist_names TEXT[],           -- 所有歌单名称的数组
-    playlist_categories TEXT[],      -- 所有歌单分类的数组
-    playlist_count INTEGER DEFAULT 0,  -- 歌单数量
-
-    -- 便于快速查询的字符串形式（可选，用于模糊匹配）
-    playlist_names_str TEXT,          -- 逗号分隔的歌单名称
-    playlist_categories_str TEXT,     -- 逗号分隔的分类
-
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 索引
-CREATE INDEX idx_song_playlist_agg_song_id ON song_playlist_agg(song_id);
-```
-
 **数据样例**：
 
 | song_id | playlist_names | playlist_categories | playlist_count |
@@ -332,30 +310,6 @@ CREATE INDEX idx_song_playlist_agg_song_id ON song_playlist_agg(song_id);
 | 1893728473 | {宁静致远, 放松身心, 深夜独酌} | {古典, 深夜} | 3 |
 | 1457702766 | {凯尔特风情, 战斗音乐} | {凯尔特, 运动} | 2 |
 
-**预聚合脚本**（离线批量执行）：
-```python
-def rebuild_song_playlist_agg():
-    """重建歌曲-歌单预聚合表（离线批量执行）"""
-    cursor.execute("TRUNCATE song_playlist_agg RESTART IDENTITY")
-
-    cursor.execute("""
-        INSERT INTO song_playlist_agg (
-            song_id, playlist_names, playlist_categories,
-            playlist_count, playlist_names_str, playlist_categories_str
-        )
-        SELECT
-            s.song_id,
-            ARRAY_AGG(DISTINCT p.playlist_name) FILTER (WHERE p.playlist_name IS NOT NULL),
-            ARRAY_AGG(DISTINCT p.category) FILTER (WHERE p.category IS NOT NULL),
-            COUNT(DISTINCT sp.playlist_id),
-            STRING_AGG(DISTINCT p.playlist_name, ', ') FILTER (WHERE p.playlist_name IS NOT NULL),
-            STRING_AGG(DISTINCT p.category, ', ') FILTER (WHERE p.category IS NOT NULL)
-        FROM songs s
-        LEFT JOIN song_playlist sp ON s.song_id = sp.song_id
-        LEFT JOIN playlists p ON sp.playlist_id = p.playlist_id
-        GROUP BY s.song_id
-    """)
-```
 
 **使用场景**：
 - 特征生成时，获取歌曲的歌单信息：直接 `SELECT * FROM song_playlist_agg WHERE song_id = ?`
@@ -373,81 +327,11 @@ def rebuild_song_playlist_agg():
 > ```
 > 详细步骤见 **6.2.1 节**。
 
-```sql
-CREATE TABLE song_comment_agg (
-    id SERIAL PRIMARY KEY,
-    song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
-
-    -- 预聚合的评论信息
-    comment_count INTEGER DEFAULT 0,       -- 评论总数
-    top_comments TEXT[],                   -- 点赞最高的评论（最多5条）
-    comment_summary TEXT,                  -- 评论内容摘要（供LLM使用）
-
-    -- 情感统计
-    positive_count INTEGER DEFAULT 0,
-    neutral_count INTEGER DEFAULT 0,
-    negative_count INTEGER DEFAULT 0,
-    avg_polarity DECIMAL(3,2),             -- 平均情感极性
-
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 索引
-CREATE INDEX idx_song_comment_agg_song_id ON song_comment_agg(song_id);
-```
-
 **数据样例**：
 
 | song_id | comment_count | top_comments | avg_polarity |
 |---------|---------------|--------------|--------------|
 | 1893728473 | 1523 | {这曲子太美了..., 战斗进行曲...} | 0.72 |
-
-**预聚合脚本**（定期从 MongoDB 同步）：
-```python
-def rebuild_song_comment_agg():
-    """从 MongoDB 重建歌曲-评论预聚合表（离线批量执行）"""
-    from pymongo import MongoClient
-
-    client = MongoClient(host=os.getenv('MONGO_HOST'), port=int(os.getenv('MONGO_PORT')))
-    db = client[os.getenv('MONGO_DB')]
-
-    cursor.execute("TRUNCATE song_comment_agg RESTART IDENTITY")
-
-    # 获取所有不同的 song_id
-    song_ids = db.comments.distinct('song_id')
-
-    for song_id in song_ids:
-        comments = list(db.comments.find(
-            {'song_id': song_id},
-            {'content': 1, 'sentiment': 1, 'polarity': 1, 'likedCount': 1}
-        ).sort('likedCount', -1).limit(5))
-
-        if not comments:
-            continue
-
-        # 聚合数据
-        top_comments = [c['content'][:200] for c in comments]
-        sentiments = [c.get('sentiment', 'neutral') for c in comments]
-        polarities = [c.get('polarity', 0) for c in comments]
-
-        positive_count = sentiments.count('positive')
-        neutral_count = sentiments.count('neutral')
-        negative_count = sentiments.count('negative')
-
-        cursor.execute("""
-            INSERT INTO song_comment_agg (
-                song_id, comment_count, top_comments, comment_summary,
-                positive_count, neutral_count, negative_count, avg_polarity
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            song_id, len(comments), top_comments, '; '.join(top_comments),
-            positive_count, neutral_count, negative_count,
-            sum(polarities) / len(polarities) if polarities else 0
-        ))
-
-    client.close()
-```
 
 ---
 
@@ -467,7 +351,7 @@ def rebuild_song_comment_agg():
 
 1. **新增歌曲**：入库时自动写入 `song_playlist_agg`（通过触发器或应用层逻辑）
 2. **歌单变更**：歌曲被加入/移除歌单时，更新对应 `song_playlist_agg` 记录
-3. **评论更新**：定期（如每天）运行 `rebuild_song_comment_agg` 增量同步
+3. **评论更新**：定期（如每天）运行 `rebuild_song_comment_agg` 增量同步, `rebuild_song_comment_agg`尚未实现
 
 ---
 
@@ -561,57 +445,6 @@ def rebuild_song_comment_agg():
 
 ---
 
-#### Step 1：创建 song_playlist_agg 表
-
-**1.1 创建表**
-
-```sql
-CREATE TABLE song_playlist_agg (
-    id SERIAL PRIMARY KEY,
-    song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
-    playlist_names TEXT[],
-    playlist_categories TEXT[],
-    playlist_count INTEGER DEFAULT 0,
-    playlist_names_str TEXT,
-    playlist_categories_str TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_song_playlist_agg_song_id ON song_playlist_agg(song_id);
-```
-
-**1.2 填充数据（一次性离线执行）**
-
-```bash
-# 连接到 PostgreSQL
-PGPASSWORD=luke psql -h localhost -U postgres -d musicdb
-
-# 执行聚合插入
-psql << 'EOF'
-TRUNCATE song_playlist_agg;
-
-INSERT INTO song_playlist_agg (
-    song_id, playlist_names, playlist_categories,
-    playlist_count, playlist_names_str, playlist_categories_str
-)
-SELECT
-    s.song_id,
-    ARRAY_AGG(DISTINCT p.playlist_name) FILTER (WHERE p.playlist_name IS NOT NULL),
-    ARRAY_AGG(DISTINCT p.category) FILTER (WHERE p.category IS NOT NULL),
-    COUNT(DISTINCT sp.playlist_id),
-    STRING_AGG(DISTINCT p.playlist_name, ', ') FILTER (WHERE p.playlist_name IS NOT NULL),
-    STRING_AGG(DISTINCT p.category, ', ') FILTER (WHERE p.category IS NOT NULL)
-FROM songs s
-LEFT JOIN song_playlist sp ON s.song_id = sp.song_id
-LEFT JOIN playlists p ON sp.playlist_id = p.playlist_id
-GROUP BY s.song_id;
-
--- 查看生成结果
-SELECT COUNT(*) FROM song_playlist_agg;
-EOF
-```
-
 **预期结果**：
 - 生成约 121 万条记录（与 songs 表行数相同）
 - 执行时间：约 5-15 分钟（取决于数据量）
@@ -639,132 +472,7 @@ LIMIT 5;
 
 **2.1 创建表**
 
-```sql
-CREATE TABLE song_comment_agg (
-    id SERIAL PRIMARY KEY,
-    song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
-    comment_count INTEGER DEFAULT 0,
-    top_comments TEXT[],
-    comment_summary TEXT,
-    positive_count INTEGER DEFAULT 0,
-    neutral_count INTEGER DEFAULT 0,
-    negative_count INTEGER DEFAULT 0,
-    avg_polarity DECIMAL(3,2),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_song_comment_agg_song_id ON song_comment_agg(song_id);
-```
-
 **2.2 填充数据（从 MongoDB 同步）**
-
-```python
-# backend/scripts/rebuild_song_comment_agg.py
-
-import psycopg2
-from pymongo import MongoClient
-import os
-from dotenv import load_dotenv
-
-load_dotenv('.env')
-
-def rebuild_song_comment_agg():
-    """从 MongoDB 重建歌曲-评论预聚合表（离线批量执行）"""
-
-    # 连接 PostgreSQL
-    pg_conn = psycopg2.connect(
-        host='localhost',
-        port=5432,
-        database='musicdb',
-        user='postgres',
-        password='luke'
-    )
-    pg_cursor = pg_conn.cursor()
-
-    # 连接 MongoDB
-    mongo_client = MongoClient(
-        host=os.getenv('MONGO_HOST', 'localhost'),
-        port=int(os.getenv('MONGO_PORT', 27017))
-    )
-    mongo_db = mongo_client[os.getenv('MONGO_DB', 'netease')]
-
-    print("清空 song_comment_agg 表...")
-    pg_cursor.execute("TRUNCATE song_comment_agg RESTART IDENTITY")
-    pg_conn.commit()
-
-    print("获取所有有评论的歌曲 ID...")
-    song_ids = mongo_db.comments.distinct('song_id')
-    total_songs = len(song_ids)
-    print(f"共有 {total_songs} 首歌曲有评论")
-
-    # 分批处理
-    batch_size = 1000
-    for i in range(0, total_songs, batch_size):
-        batch_song_ids = song_ids[i:i + batch_size]
-        print(f"处理第 {i+1} 到 {min(i+batch_size, total_songs)} 首...")
-
-        for song_id in batch_song_ids:
-            # 获取该歌曲的评论（按点赞数排序，取前5条）
-            comments = list(mongo_db.comments.find(
-                {'song_id': song_id},
-                {'content': 1, 'sentiment': 1, 'polarity': 1, 'likedCount': 1}
-            ).sort('likedCount', -1).limit(5))
-
-            if not comments:
-                continue
-
-            # 聚合数据
-            top_comments = [c['content'][:200] if c.get('content') else '' for c in comments]
-            sentiments = [c.get('sentiment', 'neutral') for c in comments]
-            polarities = [c.get('polarity', 0) for c in comments]
-
-            positive_count = sentiments.count('positive')
-            neutral_count = sentiments.count('neutral')
-            negative_count = sentiments.count('negative')
-
-            comment_count = mongo_db.comments.count_documents({'song_id': song_id})
-
-            avg_polarity = sum(polarities) / len(polarities) if polarities else 0
-
-            # 插入 PostgreSQL
-            pg_cursor.execute("""
-                INSERT INTO song_comment_agg (
-                    song_id, comment_count, top_comments, comment_summary,
-                    positive_count, neutral_count, negative_count, avg_polarity
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (song_id) DO UPDATE SET
-                    comment_count = EXCLUDED.comment_count,
-                    top_comments = EXCLUDED.top_comments,
-                    comment_summary = EXCLUDED.comment_summary,
-                    positive_count = EXCLUDED.positive_count,
-                    neutral_count = EXCLUDED.neutral_count,
-                    negative_count = EXCLUDED.negative_count,
-                    avg_polarity = EXCLUDED.avg_polarity,
-                    updated_at = CURRENT_TIMESTAMP
-            """, (
-                song_id, comment_count, top_comments, '; '.join(top_comments),
-                positive_count, neutral_count, negative_count, avg_polarity
-            ))
-
-        pg_conn.commit()
-        print(f"已处理 {min(i+batch_size, total_songs)}/{total_songs}")
-
-    # 关闭连接
-    mongo_client.close()
-    pg_cursor.close()
-    pg_conn.close()
-    print("song_comment_agg 生成完成！")
-
-if __name__ == "__main__":
-    rebuild_song_comment_agg()
-```
-
-**执行命令**：
-```bash
-cd /home/luke/code_project/music-project/backend
-~/miniconda3/envs/music/bin/python scripts/rebuild_song_comment_agg.py
-```
 
 **预期结果**：
 - 生成约 12.4 万条记录（与有评论的歌曲数相同）
@@ -792,29 +500,18 @@ LIMIT 5;
 
 > **重要**：完成 `song_playlist_agg` 和 `song_comment_agg` 的生成后，才能开始生成 `music_features`。
 
-**方式一：使用脚本填充（推荐）**
+**LLM 选择说明（速度 vs 质量）**：
 
-脚本已放置在 `scripts/init_music_feature.py`，它会：
-1. 从 `song_playlist_agg` 和 `song_comment_agg` 预聚合表获取歌曲信息（无需实时 JOIN）
-2. 调用 LLM 为每首歌曲生成特征
-3. 将特征存储到 `music_features` 表
+| LLM 选项 | 速度 | 质量 | 适用场景 |
+|----------|------|------|----------|
+| **MiniMax API（云端）** | ~15-20秒/首 | 高 | 首次大规模生成，推荐使用 |
+| **本地模型（如 Qwen、ChatGLM）** | ~3-5秒/首 | 中 | 小规模或频繁更新场景 |
+| **本地 Embedding + 规则** | ~0.1秒/首 | 低 | 快速但质量较低的占位方案 |
 
-```bash
-# 执行填充脚本
-cd /home/luke/code_project/musicRecommend
-~/miniconda3/envs/music/bin/python scripts/init_music_feature.py
-```
-
-**方式二：使用 API 批量调用**
-
-如选择通过 API 批量调用，需要先确保后端服务运行：
+**3.1 MiniMax API 生成（高质量，推荐首次使用）**
 
 ```bash
-# 启动后端服务（如未启动）
-cd /home/luke/code_project/music-project/backend
-~/miniconda3/envs/music/bin/python app.py &
-
-# 等待服务启动后，批量生成特征
+# 批量生成特征（约 12.4 万首有评论的歌曲）
 for i in {1..124}; do
   echo "Batch $i/124 started at $(date)"
   curl -s -X POST http://localhost:5000/api/features/generate \
@@ -826,6 +523,49 @@ done
 
 # 检查生成进度
 PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
+```
+
+**预计耗时**：约 6-10 分钟（124 次 × 3-5 秒/次 + 网络延迟）
+
+**3.2 本地模型生成（快速，但质量较低）**
+
+如果选择本地模型（如 Qwen2-7B），需要修改 `llm_service.py` 中的配置：
+
+```python
+# backend/services/llm_service.py
+
+class LLMService:
+    def __init__(self):
+        # 选择 1: MiniMax API（质量高，速度慢）
+        # self.client = OpenAI(
+        #     api_key=os.getenv("LLM_PROVIDER_KEY"),
+        #     base_url=os.getenv("LLM_PROVIDER_URL")
+        # )
+        # self.model = os.getenv("LLM_MODEL_NAME", "MiniMax-M2.7")
+
+        # 选择 2: 本地模型（速度快，质量中）
+        self.client = OpenAI(
+            api_key="local",
+            base_url="http://localhost:11434/v1"  # Ollama 默认地址
+        )
+        self.model = "qwen2:7b"  # 或其他本地模型
+
+        # 选择 3: 基于 Embedding 的快速方案（速度极快，质量低）
+        # self.embedding_model = "text-embedding-ada-002"
+```
+
+**本地模型优缺点**：
+- ✅ 速度快（3-5秒/首 vs 15-20秒/首）
+- ✅ 无需网络调用
+- ✅ 可离线运行
+- ❌ 质量较低，特征提取可能不够准确
+- ❌ 需要本地部署 LLM（Ollama 或其他）
+
+**3.3 混合方案（推荐用于生产环境）**
+
+```
+阶段1：使用本地快速模型生成基础特征
+阶段2：对关键歌曲（高播放量、高评论）使用云端模型重新生成
 ```
 
 ---
@@ -1811,27 +1551,11 @@ schema.sql
 
 ---
 
-##### Step 1：创建/重建数据库表（⭐ 傻瓜式一键）
+##### Step 1：创建数据库表（方式一：傻瓜式一键创建⭐）
 
-**首次创建**：
-
-```bash
-psql -h localhost -U postgres -d musicdb -f /home/luke/code_project/musicRecommend/database/schema.sql
-```
-
-**如果表已存在需重建**（表结构变更时执行）：
+**只需执行以下一条命令，即可创建全部 5 张表**：
 
 ```bash
-# 1. 删除旧表
-psql -h localhost -U postgres -d musicdb -c "
-DROP TABLE IF EXISTS song_playlist_agg CASCADE;
-DROP TABLE IF EXISTS song_comment_agg CASCADE;
-DROP TABLE IF EXISTS music_features CASCADE;
-DROP TABLE IF EXISTS recommendation_history CASCADE;
-DROP TABLE IF EXISTS recommendation_feedback CASCADE;
-"
-
-# 2. 重新创建表
 psql -h localhost -U postgres -d musicdb -f /home/luke/code_project/musicRecommend/database/schema.sql
 ```
 
@@ -1876,6 +1600,7 @@ scripts/
 ~/miniconda3/envs/music/bin/python /home/luke/code_project/musicRecommend/scripts/init_song_comment_agg.py
 ```
 注意，这里的.env是指向后端项目backend/.env的
+
 **验证填充结果**：
 ```sql
 -- 查看预聚合表数据量
