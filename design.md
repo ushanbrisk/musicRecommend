@@ -297,6 +297,12 @@ LIMIT 100;
 
 将 `songs` 通过 `song_playlist` 关联 `playlists` 的结果预先聚合存储。
 
+> **📋 快速执行**：创建表的 SQL 语句已写入 `database/schema.sql`，执行以下命令即可创建：
+> ```bash
+> psql -h localhost -U postgres -d music_db -f /home/luke/code_project/musicRecommend/database/schema.sql
+> ```
+> 详细步骤见 **6.2.1 节**。
+
 ```sql
 CREATE TABLE song_playlist_agg (
     id SERIAL PRIMARY KEY,
@@ -360,6 +366,12 @@ def rebuild_song_playlist_agg():
 ### 3.0.2 新增表：歌曲-评论预聚合表 (song_comment_agg)
 
 将 `songs` 在 MongoDB 中的评论信息预先聚合存储（可选，但建议实现）。
+
+> **📋 快速执行**：创建表的 SQL 语句已写入 `database/schema.sql`，执行以下命令即可创建：
+> ```bash
+> psql -h localhost -U postgres -d music_db -f /home/luke/code_project/musicRecommend/database/schema.sql
+> ```
+> 详细步骤见 **6.2.1 节**。
 
 ```sql
 CREATE TABLE song_comment_agg (
@@ -853,6 +865,12 @@ class LLMService:
 ### 3.1 新增表：音乐特征表 (music_features)
 
 为每首歌曲提取和存储语义特征，便于LLM理解和匹配。所有特征通过LLM分析歌曲的原始信息（歌名、艺术家、专辑、歌单名、评论内容）自动生成。
+
+> **📋 快速执行**：创建表的 SQL 语句已写入 `database/schema.sql`，执行以下命令即可创建：
+> ```bash
+> psql -h localhost -U postgres -d music_db -f /home/luke/code_project/musicRecommend/database/schema.sql
+> ```
+> 详细步骤见 **6.2.1 节**。
 
 ```sql
 CREATE TABLE music_features (
@@ -1808,115 +1826,75 @@ LLM_MODEL_NAME = 'abab6.5s-chat'
 
 #### 6.2.1 创建 PostgreSQL 数据库表
 
-**目标**：在 PostgreSQL 中创建 music_features 和 recommendation_history 表
+**目标**：在 PostgreSQL 中创建本项目所需的 5 张表。
 
-**执行步骤**：
+**文件结构说明**（`database/schema.sql`）：
+```
+schema.sql
+├── 3.0 预聚合表（避免实时 JOIN，提升查询性能）
+│   ├── song_playlist_agg      -- 歌曲-歌单预聚合表
+│   └── song_comment_agg       -- 歌曲-评论预聚合表
+├── 3.1 音乐特征表
+│   └── music_features        -- 音乐特征表
+└── 6.2 推荐历史和反馈表
+    ├── recommendation_history  -- 推荐历史表
+    └── recommendation_feedback -- 推荐反馈表
+```
 
-1. **连接到 PostgreSQL**
-   ```bash
-   psql -h localhost -U postgres -d music_db
-   # 或使用管理工具（如 pgAdmin、DBeaver）
-   ```
+---
 
-2. **创建 music_features 表**
-   ```sql
-   CREATE TABLE music_features (
-       id SERIAL PRIMARY KEY,
-       song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
+##### 方式一：傻瓜式一键创建（推荐⭐）
 
-       -- 基础特征
-       genre VARCHAR(100),
-       mood VARCHAR(200),
-       tempo VARCHAR(50),
-       instruments VARCHAR(200),
-       scene VARCHAR(200),
-       language VARCHAR(50),
-       era VARCHAR(50),
+**只需执行以下一条命令，即可创建全部 5 张表**：
 
-       -- 复杂特征
-       description TEXT,
-       emotional_tags VARCHAR(500),
-       theme_keywords VARCHAR(500),
+```bash
+psql -h localhost -U postgres -d music_db -f /home/luke/code_project/musicRecommend/database/schema.sql
+```
 
-       -- 扩展信息
-       inherited_tags VARCHAR(500),
+**验证命令**（查看表是否创建成功）：
+```sql
+\dt
+```
 
-       -- 向量表示（可选，初版先不启用）
-       -- feature_vector vector(1536),
+预期输出应包含以下 5 张表：
+```
+               List of relations
+ Schema |         Name         | Type  | Owner
+--------+----------------------+-------+-------
+ public | song_playlist_agg    | table | postgres
+ public | song_comment_agg    | table | postgres
+ public | music_features      | table | postgres
+ public | recommendation_history | table | postgres
+ public | recommendation_feedback | table | postgres
+(5 rows)
+```
 
-       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-   );
+---
 
-   -- 创建索引
-   CREATE INDEX idx_music_features_genre ON music_features(genre);
-   CREATE INDEX idx_music_features_mood ON music_features(mood);
-   CREATE INDEX idx_music_features_scene ON music_features(scene);
-   CREATE INDEX idx_music_features_song_id ON music_features(song_id);
-   ```
+##### 方式二：分步创建（如需单独调试）
 
-3. **创建 recommendation_history 表**
-   ```sql
-   CREATE TABLE recommendation_history (
-       id SERIAL PRIMARY KEY,
-       session_id VARCHAR(100),
-       user_id VARCHAR(100),
+如需逐表创建，可使用以下命令连接数据库后手动执行 SQL：
 
-       query_text TEXT NOT NULL,
-       query_type VARCHAR(50),
-       query_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+```bash
+# 连接数据库
+psql -h localhost -U postgres -d music_db
 
-       result_count INTEGER,
-       result_song_ids BIGINT[],
-       latency_ms INTEGER,
+# 在 psql 中执行
+\i /home/luke/code_project/musicRecommend/database/schema.sql
+```
 
-       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-   );
+或使用 pgAdmin、DBeaver 等工具打开 `database/schema.sql` 文件并执行。
 
-   -- 创建索引
-   CREATE INDEX idx_history_session ON recommendation_history(session_id);
-   CREATE INDEX idx_history_user ON recommendation_history(user_id);
-   CREATE INDEX idx_history_query_time ON recommendation_history(query_timestamp);
-   ```
-
-4. **创建 recommendation_feedback 分区表**（初版先用普通表）
-   ```sql
-   CREATE TABLE recommendation_feedback (
-       id SERIAL PRIMARY KEY,
-       history_id INTEGER REFERENCES recommendation_history(id) ON DELETE CASCADE,
-       song_id BIGINT NOT NULL,
-
-       playback_duration_seconds INTEGER,
-       song_duration_seconds INTEGER,
-       playback_completion_rate DECIMAL(5,2),
-       skipped BOOLEAN DEFAULT FALSE,
-       looped BOOLEAN DEFAULT FALSE,
-
-       feedback_type VARCHAR(20),
-       feedback_detail VARCHAR(100),
-       action_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-       play_source VARCHAR(50),
-
-       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-       UNIQUE(history_id, song_id)
-   );
-
-   -- 创建索引
-   CREATE INDEX idx_feedback_history ON recommendation_feedback(history_id);
-   CREATE INDEX idx_feedback_song ON recommendation_feedback(song_id);
-   CREATE INDEX idx_feedback_type ON recommendation_feedback(feedback_type);
-   CREATE INDEX idx_feedback_skipped ON recommendation_feedback(skipped);
-   CREATE INDEX idx_feedback_completion ON recommendation_feedback(playback_completion_rate);
-   ```
+---
 
 > **⚠️ 重要说明：与原有 schema.sql 的关系**
 >
-> 本阶段新建的三个表（`music_features`、`recommendation_history`、`recommendation_feedback`）**独立于** `~/code_project/music-project/database/schema.sql` 中原有的表结构。
+> 本阶段新建的表（`song_playlist_agg`、`song_comment_agg`、`music_features`、`recommendation_history`、`recommendation_feedback`）**独立于** `~/code_project/music-project/database/schema.sql` 中原有的表结构。
 >
-> - **原有项目**（`music-project/database/schema.sql`）：包含 `songs`、`playlists`、`artists`、`song_playlist`、`comments`、`male_artists`、`female_artists`、`artist_songs_relation`
-> - **本项目新增**（本章设计）：`music_features`、`recommendation_history`、`recommendation_feedback`
+> - **原有项目**（`music-project/database/schema.sql`）：包含 `songs`、`playlists`、`artists`、`song_playlist`、`comments` 等
+> - **本项目新增**（本章设计）：上述 5 张表
 >
-> 两套表结构**共存于同一个数据库**，通过 `song_id` 外键关联。本项目设计的新表**不会修改**原有项目中的 `schema.sql` 文件，以确保两项目的独立性。
+> 两套表结构**共存于同一个数据库**，通过 `song_id` 外键关联。
 >
 > **创建方式**：已在本项目 `database/schema.sql` 中准备好完整的 CREATE TABLE 语句。在数据库中执行以下命令即可创建：
 > ```bash
@@ -1926,13 +1904,8 @@ LLM_MODEL_NAME = 'abab6.5s-chat'
 >
 > **验证命令**：
 > ```sql
-> \dt music_features recommendation_history recommendation_feedback
+> \dt
 > ```
-
-5. **验证表创建成功**
-   ```sql
-   \dt music_features recommendation_history recommendation_feedback
-   ```
 
 #### 6.2.2 MongoDB 索引状态
 
