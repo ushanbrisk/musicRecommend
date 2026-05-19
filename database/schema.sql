@@ -23,8 +23,8 @@ CREATE TABLE IF NOT EXISTS song_playlist_agg (
     playlist_count INTEGER DEFAULT 0,  -- 歌单数量
 
     -- 便于快速查询的字符串形式（可选，用于模糊匹配）
-    playlist_names_str VARCHAR(1000),  -- 逗号分隔的歌单名称
-    playlist_categories_str VARCHAR(500), -- 逗号分隔的分类
+    playlist_names_str TEXT,          -- 逗号分隔的歌单名称
+    playlist_categories_str TEXT,     -- 逗号分隔的分类
 
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP

@@ -299,7 +299,7 @@ LIMIT 100;
 
 > **📋 快速执行**：创建表的 SQL 语句已写入 `database/schema.sql`，执行以下命令即可创建：
 > ```bash
-> psql -h localhost -U postgres -d music_db -f /home/luke/code_project/musicRecommend/database/schema.sql
+> psql -h localhost -U postgres -d musicdb -f /home/luke/code_project/musicRecommend/database/schema.sql
 > ```
 > 详细步骤见 **6.2.1 节**。
 
@@ -314,8 +314,8 @@ CREATE TABLE song_playlist_agg (
     playlist_count INTEGER DEFAULT 0,  -- 歌单数量
 
     -- 便于快速查询的字符串形式（可选，用于模糊匹配）
-    playlist_names_str VARCHAR(1000),  -- 逗号分隔的歌单名称
-    playlist_categories_str VARCHAR(500), -- 逗号分隔的分类
+    playlist_names_str TEXT,          -- 逗号分隔的歌单名称
+    playlist_categories_str TEXT,     -- 逗号分隔的分类
 
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -369,7 +369,7 @@ def rebuild_song_playlist_agg():
 
 > **📋 快速执行**：创建表的 SQL 语句已写入 `database/schema.sql`，执行以下命令即可创建：
 > ```bash
-> psql -h localhost -U postgres -d music_db -f /home/luke/code_project/musicRecommend/database/schema.sql
+> psql -h localhost -U postgres -d musicdb -f /home/luke/code_project/musicRecommend/database/schema.sql
 > ```
 > 详细步骤见 **6.2.1 节**。
 
@@ -572,8 +572,8 @@ CREATE TABLE song_playlist_agg (
     playlist_names TEXT[],
     playlist_categories TEXT[],
     playlist_count INTEGER DEFAULT 0,
-    playlist_names_str VARCHAR(1000),
-    playlist_categories_str VARCHAR(500),
+    playlist_names_str TEXT,
+    playlist_categories_str TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -868,7 +868,7 @@ class LLMService:
 
 > **📋 快速执行**：创建表的 SQL 语句已写入 `database/schema.sql`，执行以下命令即可创建：
 > ```bash
-> psql -h localhost -U postgres -d music_db -f /home/luke/code_project/musicRecommend/database/schema.sql
+> psql -h localhost -U postgres -d musicdb -f /home/luke/code_project/musicRecommend/database/schema.sql
 > ```
 > 详细步骤见 **6.2.1 节**。
 
@@ -1843,12 +1843,28 @@ schema.sql
 
 ---
 
-##### 方式一：傻瓜式一键创建（推荐⭐）
+##### Step 1：创建/重建数据库表（⭐ 傻瓜式一键）
 
-**只需执行以下一条命令，即可创建全部 5 张表**：
+**首次创建**：
 
 ```bash
-psql -h localhost -U postgres -d music_db -f /home/luke/code_project/musicRecommend/database/schema.sql
+psql -h localhost -U postgres -d musicdb -f /home/luke/code_project/musicRecommend/database/schema.sql
+```
+
+**如果表已存在需重建**（表结构变更时执行）：
+
+```bash
+# 1. 删除旧表
+psql -h localhost -U postgres -d musicdb -c "
+DROP TABLE IF EXISTS song_playlist_agg CASCADE;
+DROP TABLE IF EXISTS song_comment_agg CASCADE;
+DROP TABLE IF EXISTS music_features CASCADE;
+DROP TABLE IF EXISTS recommendation_history CASCADE;
+DROP TABLE IF EXISTS recommendation_feedback CASCADE;
+"
+
+# 2. 重新创建表
+psql -h localhost -U postgres -d musicdb -f /home/luke/code_project/musicRecommend/database/schema.sql
 ```
 
 **验证命令**（查看表是否创建成功）：
@@ -1871,13 +1887,54 @@ psql -h localhost -U postgres -d music_db -f /home/luke/code_project/musicRecomm
 
 ---
 
-##### 方式二：分步创建（如需单独调试）
+##### Step 2：填充预聚合表数据
+
+创建表后，需要填充 `song_playlist_agg` 和 `song_comment_agg` 的数据。
+
+**scripts 目录结构**：
+```
+scripts/
+├── init_song_playlist_agg.py   -- 填充 song_playlist_agg（从 PostgreSQL 聚合）
+└── init_song_comment_agg.py    -- 填充 song_comment_agg（从 MongoDB 同步）
+```
+
+**一键填充全部预聚合表**：
+
+```bash
+# 填充 song_playlist_agg（从 songs + playlists 聚合）
+~/miniconda3/envs/music/bin/python /home/luke/code_project/musicRecommend/scripts/init_song_playlist_agg.py
+
+# 填充 song_comment_agg（从 MongoDB 同步评论）
+~/miniconda3/envs/music/bin/python /home/luke/code_project/musicRecommend/scripts/init_song_comment_agg.py
+```
+注意，这里的.env是指向后端项目backend/.env的
+**验证填充结果**：
+```sql
+-- 查看预聚合表数据量
+SELECT
+    (SELECT COUNT(*) FROM song_playlist_agg) AS playlist_agg_count,
+    (SELECT COUNT(*) FROM song_comment_agg) AS comment_agg_count;
+```
+
+预期输出：
+```
+ playlist_agg_count | comment_agg_count
+--------------------+-------------------
+            1214166 |            124000
+(1 row)
+```
+
+> **说明**：`song_playlist_agg` 约121万条（与 songs 表行数相同），`song_comment_agg` 约12.4万条（仅包含有评论的歌曲）。
+
+---
+
+##### 可选：分步创建（如需单独调试）
 
 如需逐表创建，可使用以下命令连接数据库后手动执行 SQL：
 
 ```bash
 # 连接数据库
-psql -h localhost -U postgres -d music_db
+psql -h localhost -U postgres -d musicdb
 
 # 在 psql 中执行
 \i /home/luke/code_project/musicRecommend/database/schema.sql
@@ -1898,7 +1955,7 @@ psql -h localhost -U postgres -d music_db
 >
 > **创建方式**：已在本项目 `database/schema.sql` 中准备好完整的 CREATE TABLE 语句。在数据库中执行以下命令即可创建：
 > ```bash
-> psql -h localhost -U postgres -d music_db -f /home/luke/code_project/musicRecommend/database/schema.sql
+> psql -h localhost -U postgres -d musicdb -f /home/luke/code_project/musicRecommend/database/schema.sql
 > ```
 > 详细步骤见 `database/readme.md`。
 >
@@ -2528,7 +2585,7 @@ def get_db_connection():
     return psycopg2.connect(
         host=os.getenv('POSTGRES_HOST', 'localhost'),
         port=os.getenv('POSTGRES_PORT', 5432),
-        database=os.getenv('POSTGRES_DB', 'music_db'),
+        database=os.getenv('POSTGRES_DB', 'musicdb'),
         user=os.getenv('POSTGRES_USER', 'postgres'),
         password=os.getenv('POSTGRES_PASSWORD', '')
     )
@@ -2791,7 +2848,7 @@ curl -X POST http://localhost:5000/api/features/generate \
 
 | 服务 | 检查命令 | 预期结果 |
 |------|----------|----------|
-| PostgreSQL | `psql -h localhost -U postgres -d music_db -c "SELECT 1"` | 返回 `1` |
+| PostgreSQL | `psql -h localhost -U postgres -d musicdb -c "SELECT 1"` | 返回 `1` |
 | MongoDB | `mongosh --eval "db.adminCommand('ping')"` | 返回 `{ ok: 1 }` |
 | LLM API | 测试 `llm_service.py` 中的 chat 方法 | 返回正常响应 |
 
