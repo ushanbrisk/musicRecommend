@@ -60,11 +60,6 @@
 |-------------|---------------|----------|
 | 7213567821 | 【古典】宁静致远 · 放松身心 | 古典 |
 | 6521347890 | 夜深沉 · 孤独患者的深夜独酌 | 深夜 |
-| 8097451234 | 凯尔特风情 · 翡翠之岛的旋律 | 凯尔特 |
-| 7456321890 | 工作时的专注背景音 | 工作 |
-| 6789012345 | 地铁上的通勤时光 | 通勤 |
-| 7123456789 | 运动健身 · 燃脂动感 | 运动 |
-| 7890123456 | 心情郁闷时听的100首治愈系 | 治愈 |
 
 **文本信息利用构想：**
 - `playlist_name` 包含丰富的场景/情绪信息（"宁静致远"、"深夜独酌"、"燃脂动感"）
@@ -88,8 +83,6 @@
 |---------|-------------|----------|
 | 1893728473 | 7213567821 | 【古典】宁静致远 · 放松身心 |
 | 1893728473 | 6521347890 | 夜深沉 · 孤独患者的深夜独酌 |
-| 1457702766 | 7213567821 | 【古典】宁静致远 · 放松身心 |
-| 1457702766 | 8097451234 | 凯尔特风情 · 翡翠之岛的旋律 |
 
 **文本信息利用构想：**
 - 一首歌曲可属于多个歌单，聚合所有歌单的 `playlist_name` 和 `category`
@@ -118,8 +111,6 @@
 |---------|---------|-----------|----------|
 | 1893728473 | 这曲子太美了，夜晚独自聆听仿佛置身星河 | positive | 0.85 |
 | 1893728473 | 一般般，没什么感觉 | neutral | 0.1 |
-| 1457702766 | 战斗进行曲！每次听都热血沸腾！ | positive | 0.92 |
-| 1457702766 | 听起来有点压抑 | negative | -0.3 |
 
 **文本信息利用构想：**
 - `content` 字段包含大量用户生成的文本描述，可提取：
@@ -1669,22 +1660,6 @@ SELECT
 
 ---
 
-##### 可选：分步创建（如需单独调试）
-
-如需逐表创建，可使用以下命令连接数据库后手动执行 SQL：
-
-```bash
-# 连接数据库
-psql -h localhost -U postgres -d musicdb
-
-# 在 psql 中执行
-\i /home/luke/code_project/musicRecommend/database/schema.sql
-```
-
-或使用 pgAdmin、DBeaver 等工具打开 `database/schema.sql` 文件并执行。
-
----
-
 > **⚠️ 重要说明：与原有 schema.sql 的关系**
 >
 > 本阶段新建的表（`song_playlist_agg`、`song_comment_agg`、`music_features`、`recommendation_history`、`recommendation_feedback`）**独立于** `~/code_project/music-project/database/schema.sql` 中原有的表结构。
@@ -1775,17 +1750,12 @@ from typing import List, Dict, Optional
 class LLMService:
     def __init__(self):
         self.client = OpenAI(
-            api_key=os.getenv("LLM_PROVIDER_KEY"),
-            base_url=os.getenv("LLM_PROVIDER_URL")  # 如 "https://api.minimax.chat"
         )
         self.model = os.getenv("LLM_MODEL_NAME", "abab6.5s-chat")
 
     def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
         """发送对话请求"""
         response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=temperature
         )
         return response.choices[0].message.content
 
@@ -2017,9 +1987,6 @@ from .feature_service import FeatureService
 
 class RecommendService:
     def __init__(self, db_connection):
-        self.db = db_connection
-        self.llm = LLMService()
-        self.feature_service = FeatureService(db_connection)
 
     def recommend(self, query: str, session_id: str = None,
                   max_results: int = 20, user_id: str = None) -> Dict:
@@ -2041,21 +2008,10 @@ class RecommendService:
 
         # 5. 记录推荐历史
         history_id = self.save_history(
-            session_id=session_id,
-            user_id=user_id,
-            query_text=query,
-            query_type=query_type,
-            result_song_ids=[r['song_id'] for r in match_result],
-            latency_ms=int((time.time() - start_time) * 1000)
         )
 
         # 6. 构建返回结果
         return self.build_response(
-            query=query,
-            query_type=query_type,
-            matches=match_result,
-            history_id=history_id,
-            latency_ms=int((time.time() - start_time) * 1000)
         )
 
     def classify_query(self, query: str) -> str:

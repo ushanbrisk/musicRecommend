@@ -175,12 +175,20 @@ def extract_features_batch(songs: list, llm_client, model_name: str) -> list:
     """批量调用 LLM 提取歌曲特征"""
     prompt = build_batch_feature_prompt(songs)
 
+    batch_size = len(songs)
+    start_time = time.time()
+    print(f"      [LLM调用开始] batch_size={batch_size}, timestamp={start_time:.3f}")
+    
     response = llm_client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
         timeout=300
     )
+    
+    end_time = time.time()
+    elapsed = end_time - start_time
+    print(f"      [LLM调用完成] batch_size={batch_size}, elapsed={elapsed:.3f}s, songs/sec={batch_size/elapsed:.2f}" if elapsed > 0 else f"      [LLM调用完成] batch_size={batch_size}, elapsed={elapsed:.3f}s")
 
     try:
         content = response.choices[0].message.content.strip()
