@@ -483,3 +483,91 @@ def main():
 | **评论限制** | 预聚合表已压缩到 5 条以内，无需 Map-Reduce |
 | **框架选择** | vLLM（Continuous Batching 自动合并不同长度任务） |
 | **预估耗时** | ~12-13 分钟处理 12 万首歌曲 |
+
+---
+
+## 11. 创建的文件
+
+### 11.1 scripts/start_vllm_servers.sh
+
+vLLM 服务启动脚本
+
+**使用方法**：
+```bash
+bash scripts/start_vllm_servers.sh all      # 启动两组服务
+bash scripts/start_vllm_servers.sh group_a   # 只启动组A
+bash scripts/start_vllm_servers.sh status    # 查看状态
+bash scripts/start_vllm_servers.sh stop      # 停止服务
+```
+
+**功能**：
+- 启动组 A：2×RTX 3090 → Qwen3.6-27B (Int4, TP=2)，端口 8000
+- 启动组 B：4×RTX 3080 → Qwen3.6-30B-A3B (Int4, TP=4)，端口 8001
+- 模型加载完成后自动检测
+- 日志输出到 `logs/vllm_group_*.log`
+
+### 11.2 scripts/init_music_feature_vllm.py
+
+vLLM 批量特征生成脚本
+
+**运行命令**：
+```bash
+~/miniconda3/envs/music/bin/python scripts/init_music_feature_vllm.py
+```
+
+**功能**：
+- 按 `song_id % 2` 分组并行调用两组 vLLM
+- 每批 20 首歌曲（可配置 `VLLM_BATCH_SIZE`）
+- 异步 IO + aiohttp 高并发调用
+- 自动重试、错误处理
+- 进度显示和耗时统计
+
+### 11.3 backend/services/vllm_service.py
+
+vLLM 服务封装，供 Flask 后端实时推荐使用
+
+### 11.4 backend/config.py（更新）
+
+新增 vLLM 配置项：
+
+```python
+VLLM_ENDPOINT_A = 'http://localhost:8000/v1/chat/completions'
+VLLM_ENDPOINT_B = 'http://localhost:8001/v1/chat/completions'
+VLLM_BATCH_SIZE = 20
+```
+
+---
+
+## 12. 使用流程
+
+### 12.1 安装依赖
+
+```bash
+pip install vllm>=0.4.0 aiohttp
+```
+
+### 12.2 启动 vLLM 服务
+
+```bash
+bash scripts/start_vllm_servers.sh all
+```
+
+> 模型加载需要几分钟时间，可通过以下命令查看状态：
+> ```bash
+> bash scripts/start_vllm_servers.sh status
+> ```
+
+### 12.3 运行批量特征生成
+
+```bash
+~/miniconda3/envs/music/bin/python scripts/init_music_feature_vllm.py
+```
+
+### 12.4 查看结果
+
+特征生成后，验证数据：
+
+```bash
+PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
+PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT song_id, genre, mood FROM music_features LIMIT 3;"
+```
