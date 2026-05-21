@@ -13,7 +13,7 @@
 
 ### 1.2 当前方案问题
 
-现有 `init_music_feature.py` 的问题：
+现有 `init_music_feature_api.py` 的问题：
 
 | 问题 | 影响 |
 |------|------|
@@ -25,8 +25,9 @@
 ### 1.3 硬件环境
 
 ```
-组 A：2 × RTX 3090 (24GB)  → 适合部署大参数模型
-组 B：4 × RTX 3080 (20GB)  → 适合部署 MoE 模型
+组 A：2 × RTX 3090 (24GB)  → GPU 0, 4
+组 B：2 × RTX 3080 (20GB)  → GPU 1, 2
+空闲：GPU 3, 5 (备用)
 ```
 
 ---
@@ -37,8 +38,8 @@
 
 | 组 | GPU | 推荐模型 | 理由 |
 |----|-----|----------|------|
-| **组 A** | 2 × RTX 3090 (24GB) | **Qwen3.6-27B (Int4)** | 27B 模型理解能力强，总结质量高；Int4 量化后约 17-18GB，双卡 TP 加载 |
-| **组 B** | 4 × RTX 3080 (20GB) | **Qwen3.6-30B-A3B (MoE, Int4)** | MoE 架构，激活参数仅 3B，推理极快；适合大批量处理 |
+| **组 A** | 2 × RTX 3090 (24GB) | **Qwen2.5-32B-Instruct (AWQ Int4)** | 32B 模型理解能力强；Int4 量化后约 16GB，双卡 TP=2 加载 |
+| **组 B** | 2 × RTX 3080 (20GB) | **Qwen2.5-14B-Instruct (AWQ Int4)** | 14B 模型适合批量处理；Int4 量化后约 8GB，双卡 TP=2 加载 |
 
 > 注：截至 2026-05-20，Qwen3.7-Max 为旗舰版，但开源社区主流稳定版为 Qwen3.6 系列。
 
@@ -55,9 +56,9 @@
                     │   组 A 服务      │    │       组 B 服务          │
                     │  (vLLM Server)  │    │    (vLLM Server)        │
                     │                 │    │                         │
-                    │  2 × RTX 3090   │    │  4 × RTX 3080          │
-                    │  Qwen3.6-27B    │    │  Qwen3.6-30B-A3B       │
-                    │  Int4 + TP=2    │    │  Int4 + TP=4           │
+                    │  2 × RTX 3090   │    │  2 × RTX 3080          │
+                    │  Qwen2.5-32B    │    │  Qwen2.5-14B           │
+                    │  Int4 + TP=2    │    │  Int4 + TP=2           │
                     │                 │    │                         │
                     │  端口: 8000     │    │  端口: 8001             │
                     └─────────────────┘    └─────────────────────────┘
@@ -75,32 +76,30 @@
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen3.6-27B-Chat \
-    --quantization gptq \
-    --bits 4 \
+    --model Qwen/Qwen2.5-32B-Instruct \
+    --quantization awq \
     --tensor-parallel-size 2 \
     --host 0.0.0.0 \
     --port 8000 \
     --gpu-memory-utilization 0.90 \
-    --max-model-len 16384 \
+    --max-model-len 8192 \
     --batch-size 32 \
-    --enforce-eager
+    --trust-remote-code
 ```
 
-**组 B（4 × RTX 3080，张量并行=4）**：
+**组 B（2 × RTX 3080，张量并行=2）**：
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen3.6-30B-A3B-Chat \
-    --quantization gptq \
-    --bits 4 \
-    --tensor-parallel-size 4 \
+    --model Qwen/Qwen2.5-14B-Instruct \
+    --quantization awq \
+    --tensor-parallel-size 2 \
     --host 0.0.0.0 \
     --port 8001 \
     --gpu-memory-utilization 0.90 \
-    --max-model-len 16384 \
+    --max-model-len 8192 \
     --batch-size 64 \
-    --enforce-eager
+    --trust-remote-code
 ```
 
 ---
@@ -298,14 +297,14 @@ BATCH_MUSIC_FEATURE_PROMPT = """请为以下批量歌曲生成特征信息。每
 
 | 配置 | 模型 | 每批歌曲数 | 预估速度 |
 |------|------|------------|----------|
-| 组 A (2×3090) | Qwen3.6-27B Int4 | 20 | ~60 songs/s |
-| 组 B (4×3080) | Qwen3.6-30B-A3B MoE | 32 | ~100 songs/s |
-| **合计** | - | - | **~160 songs/s** |
+| 组 A (2×3090) | Qwen2.5-32B Int4 | 20 | ~40 songs/s |
+| 组 B (2×3080) | Qwen2.5-14B Int4 | 32 | ~60 songs/s |
+| **合计** | - | - | **~100 songs/s** |
 
 ### 6.2 总耗时估算
 
 ```
-12万首歌曲 ÷ 160 songs/s ≈ 750 秒 ≈ 12-13 分钟
+12万首歌曲 ÷ 100 songs/s ≈ 1200 秒 ≈ 20 分钟
 ```
 
 ### 6.3 优化空间
@@ -477,12 +476,13 @@ def main():
 
 | 要点 | 建议 |
 |------|------|
-| **模型选择** | 组A用 Qwen3.6-27B Int4，组B用 Qwen3.6-30B-A3B MoE |
+| **模型选择** | 组A用 Qwen2.5-32B-Instruct Int4，组B用 Qwen2.5-14B-Instruct Int4 |
+| **GPU分配** | 组A用 2×RTX 3090 (GPU 0,4)，组B用 2×RTX 3080 (GPU 1,2)，空闲 GPU 3,5 |
 | **并行策略** | 按 song_id 哈希分两组，vLLM 服务并行处理 |
-| **批量策略** | 每批 20-32 首歌曲，控制在 16K tokens 以内 |
+| **批量策略** | 每批 20-32 首歌曲，控制在 8K tokens 以内 |
 | **评论限制** | 预聚合表已压缩到 5 条以内，无需 Map-Reduce |
 | **框架选择** | vLLM（Continuous Batching 自动合并不同长度任务） |
-| **预估耗时** | ~12-13 分钟处理 12 万首歌曲 |
+| **预估耗时** | ~20 分钟处理 12 万首歌曲 |
 
 ---
 
@@ -501,8 +501,9 @@ bash scripts/start_vllm_servers.sh stop      # 停止服务
 ```
 
 **功能**：
-- 启动组 A：2×RTX 3090 → Qwen3.6-27B (Int4, TP=2)，端口 8000
-- 启动组 B：4×RTX 3080 → Qwen3.6-30B-A3B (Int4, TP=4)，端口 8001
+- 启动组 A：2×RTX 3090 (GPU 0,4) → Qwen2.5-32B-Instruct (AWQ Int4, TP=2)，端口 8000
+- 启动组 B：2×RTX 3080 (GPU 1,2) → Qwen2.5-14B-Instruct (AWQ Int4, TP=2)，端口 8001
+- 空闲 GPU 3, 5 备用
 - 模型加载完成后自动检测
 - 日志输出到 `logs/vllm_group_*.log`
 
@@ -543,13 +544,19 @@ VLLM_BATCH_SIZE = 20
 ### 12.1 安装依赖
 
 ```bash
-pip install vllm>=0.4.0 aiohttp
+conda create -n music_recommend python=3.10 -y
+conda activate music_recommend
+pip install --upgrade pip
+
+pip install vllm>=0.4.0 aiohttp 
+or pip install -r requirements.txt
 ```
 
 ### 12.2 启动 vLLM 服务
 
 ```bash
 bash scripts/start_vllm_servers.sh all
+bash scripts/start_vllm_servers_v2.sh start | stop | status
 ```
 
 > 模型加载需要几分钟时间，可通过以下命令查看状态：

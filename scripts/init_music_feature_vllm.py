@@ -40,8 +40,10 @@ from typing import List, Dict, Optional
 from datetime import datetime
 
 # 添加项目路径
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'music-project', 'backend'))
-from config import Config
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env'))
 
 # =============================================================================
 # 配置
@@ -101,11 +103,11 @@ MUSIC_FEATURE_SYSTEM_PROMPT = """你是一个专业的音乐分析师，负责�
 def get_db_connection():
     """获取 PostgreSQL 连接"""
     return psycopg2.connect(
-        host=os.getenv('DB_HOST', 'localhost'),
-        port=int(os.getenv('DB_PORT', 5432)),
-        database=os.getenv('DB_NAME', 'musicdb'),
-        user=os.getenv('DB_USER', 'postgres'),
-        password=os.getenv('DB_PASSWORD', '')
+        host=os.getenv('PG_HOST', 'localhost'),
+        port=int(os.getenv('PG_PORT', '5432')),
+        database=os.getenv('PG_DB', 'musicdb'),
+        user=os.getenv('PG_USER', 'postgres'),
+        password=os.getenv('PG_PASSWORD', 'luke')
     )
 
 

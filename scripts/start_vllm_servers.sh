@@ -21,22 +21,25 @@ LOG_DIR="$PROJECT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
 # vLLM 模型配置（根据 inference.md）
-# 组 A: 2 × RTX 3090
-MODEL_GROUP_A="Qwen/Qwen3.6-27B-Chat"
+# 实际硬件配置：GPU 0,4,5 是 3090(24GB)，GPU 1,2,3 是 3080(20GB)
+
+# 组 A: 2 × RTX 3090 (GPU 0, 4)
+MODEL_GROUP_A="Qwen/Qwen2.5-32B-Instruct"
 TP_GROUP_A=2
 PORT_GROUP_A=8000
-GPU_GROUP_A="0,1"  # 根据实际 GPU ID 调整
+GPU_GROUP_A="0,4"
 
-# 组 B: 4 × RTX 3080
-MODEL_GROUP_B="Qwen/Qwen3.6-30B-A3B-Chat"
-TP_GROUP_B=4
+# 组 B: 2 × RTX 3080 (GPU 1, 2)
+MODEL_GROUP_B="Qwen/Qwen2.5-14B-Instruct"
+TP_GROUP_B=2
 PORT_GROUP_B=8001
-GPU_GROUP_B="2,3,4,5"  # 根据实际 GPU ID 调整
+GPU_GROUP_B="1,2"
 
 # 通用配置
-MAX_MODEL_LEN=16384
-BATCH_SIZE_GROUP_A=16
-BATCH_SIZE_GROUP_B=32
+QUANTIZATION="awq"
+MAX_MODEL_LEN=8192
+MAX_NUM_SEQS_GROUP_A=32
+MAX_NUM_SEQS_GROUP_B=64
 GPU_MEMORY_UTILIZATION=0.90
 
 # =============================================================================
@@ -64,7 +67,7 @@ check_vllm() {
 }
 
 check_cuda() {
-    if ! command -nvidia-smi &> /dev/null; then
+    if ! command -v nvidia-smi &> /dev/null; then
         error "nvidia-smi 未找到，CUDA 可能未正确安装"
         exit 1
     fi
@@ -80,53 +83,55 @@ check_cuda() {
 start_group_a() {
     log "启动组 A 服务..."
     log "  模型: $MODEL_GROUP_A"
+    log "  量化: $QUANTIZATION"
     log "  张量并行: $TP_GROUP_A"
     log "  端口: $PORT_GROUP_A"
-    log "  GPU: $GPU_GROUP_A"
+    log "  GPU: $GPU_GROUP_A (2×RTX 3090)"
 
     export CUDA_VISIBLE_DEVICES="$GPU_GROUP_A"
 
     nohup python -m vllm.entrypoints.openai.api_server \
         --model "$MODEL_GROUP_A" \
-        --quantization gptq \
-        --bits 4 \
+        --quantization "$QUANTIZATION" \
         --tensor-parallel-size $TP_GROUP_A \
         --host 0.0.0.0 \
         --port $PORT_GROUP_A \
         --gpu-memory-utilization $GPU_MEMORY_UTILIZATION \
         --max-model-len $MAX_MODEL_LEN \
-        --batch-size $BATCH_SIZE_GROUP_A \
-        --enforce-eager \
+        --max-num-seqs $MAX_NUM_SEQS_GROUP_A \
+        --trust-remote-code \
         > "$LOG_DIR/vllm_group_a.log" 2>&1 &
 
     echo $! > "$LOG_DIR/vllm_group_a.pid"
     log "组 A 服务已启动，PID: $(cat $LOG_DIR/vllm_group_a.pid)"
+    log "日志: $LOG_DIR/vllm_group_a.log"
 }
 
 start_group_b() {
     log "启动组 B 服务..."
     log "  模型: $MODEL_GROUP_B"
+    log "  量化: $QUANTIZATION"
     log "  张量并行: $TP_GROUP_B"
     log "  端口: $PORT_GROUP_B"
-    log "  GPU: $GPU_GROUP_B"
+    log "  GPU: $GPU_GROUP_B (2×RTX 3080)"
 
     export CUDA_VISIBLE_DEVICES="$GPU_GROUP_B"
 
     nohup python -m vllm.entrypoints.openai.api_server \
         --model "$MODEL_GROUP_B" \
-        --quantization gptq \
-        --bits 4 \
+        --quantization "$QUANTIZATION" \
         --tensor-parallel-size $TP_GROUP_B \
         --host 0.0.0.0 \
         --port $PORT_GROUP_B \
         --gpu-memory-utilization $GPU_MEMORY_UTILIZATION \
         --max-model-len $MAX_MODEL_LEN \
-        --batch-size $BATCH_SIZE_GROUP_B \
-        --enforce-eager \
+        --max-num-seqs $MAX_NUM_SEQS_GROUP_B \
+        --trust-remote-code \
         > "$LOG_DIR/vllm_group_b.log" 2>&1 &
 
     echo $! > "$LOG_DIR/vllm_group_b.pid"
     log "组 B 服务已启动，PID: $(cat $LOG_DIR/vllm_group_b.pid)"
+    log "日志: $LOG_DIR/vllm_group_b.log"
 }
 
 stop_group_a() {
@@ -237,8 +242,8 @@ main() {
         *)
             echo "使用方法: $0 [group_a|group_b|all|stop|status]"
             echo ""
-            echo "  group_a  - 启动组 A (2×RTX 3090, Qwen3.6-27B)"
-            echo "  group_b  - 启动组 B (4×RTX 3080, Qwen3.6-30B-A3B)"
+            echo "  group_a  - 启动组 A (3×RTX 3090: GPU 0,4,5 → Qwen2.5-32B-Instruct)"
+            echo "  group_b  - 启动组 B (3×RTX 3080: GPU 1,2,3 → Qwen2.5-14B-Instruct)"
             echo "  all      - 启动所有服务 (默认)"
             echo "  stop     - 停止所有服务"
             echo "  status   - 查看服务状态"
