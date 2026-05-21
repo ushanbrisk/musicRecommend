@@ -24,13 +24,13 @@ mkdir -p "$LOG_DIR"
 # 实际硬件配置：GPU 0,4,5 是 3090(24GB)，GPU 1,2,3 是 3080(20GB)
 
 # 组 A: 2 × RTX 3090 (GPU 0, 4)
-MODEL_GROUP_A="Qwen/Qwen2.5-32B-Instruct"
+MODEL_GROUP_A="Qwen/Qwen2.5-32B-Instruct-AWQ"
 TP_GROUP_A=2
 PORT_GROUP_A=8000
 GPU_GROUP_A="0,4"
 
 # 组 B: 2 × RTX 3080 (GPU 1, 2)
-MODEL_GROUP_B="Qwen/Qwen2.5-14B-Instruct"
+MODEL_GROUP_B="Qwen/Qwen2.5-14B-Instruct-AWQ"
 TP_GROUP_B=2
 PORT_GROUP_B=8001
 GPU_GROUP_B="1,2"
