@@ -21,7 +21,7 @@ vLLM 批量特征生成脚本
    bash scripts/start_vllm_servers.sh all
 
 2. 运行特征生成:
-   ~/miniconda3/envs/music/bin/python scripts/init_music_feature_vllm.py
+   ~/miniconda3/envs/music_recommend/bin/python scripts/init_music_feature_vllm.py
 
 3. 查看服务状态:
    bash scripts/start_vllm_servers.sh status
@@ -50,11 +50,27 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 # =============================================================================
 
 # vLLM 服务端点
-VLLM_ENDPOINT_A = "http://localhost:8000/v1/chat/completions"
-VLLM_ENDPOINT_B = "http://localhost:8001/v1/chat/completions"
+VLLM_ENDPOINT_A = "http://localhost:8000"
+VLLM_ENDPOINT_B = "http://localhost:8001"
+
+# 动态获取模型名称
+def get_vllm_model(endpoint: str) -> str:
+    import urllib.request
+    import json
+    url = f"{endpoint}/v1/models"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            return data['data'][0]['id']
+    except Exception as e:
+        print(f"获取模型名称失败 {endpoint}: {e}")
+        return None
+
+VLLM_MODEL_A = get_vllm_model(VLLM_ENDPOINT_A)
+VLLM_MODEL_B = get_vllm_model(VLLM_ENDPOINT_B)
 
 # 批量配置
-BATCH_SIZE = int(os.getenv('VLLM_BATCH_SIZE', '20'))  # 每批歌曲数
+BATCH_SIZE = int(os.getenv('VLLM_BATCH_SIZE', '2'))  # 每批歌曲数
 MAX_TOKENS = 2048
 TEMPERATURE = 0.3
 REQUEST_TIMEOUT = 180  # 秒
@@ -103,11 +119,11 @@ MUSIC_FEATURE_SYSTEM_PROMPT = """你是一个专业的音乐分析师，负责�
 def get_db_connection():
     """获取 PostgreSQL 连接"""
     return psycopg2.connect(
-        host=os.getenv('PG_HOST', 'localhost'),
-        port=int(os.getenv('PG_PORT', '5432')),
-        database=os.getenv('PG_DB', 'musicdb'),
-        user=os.getenv('PG_USER', 'postgres'),
-        password=os.getenv('PG_PASSWORD', 'luke')
+        host=os.getenv('DB_HOST', 'localhost'),
+        port=int(os.getenv('DB_PORT', '5432')),
+        database=os.getenv('DB_NAME', 'musicdb'),
+        user=os.getenv('DB_USER', 'postgres'),
+        password=os.getenv('DB_PASSWORD', 'luke')
     )
 
 
@@ -178,7 +194,7 @@ def get_songs_without_features_for_group(cursor, group: int, limit: int = 100) -
         WHERE mf.id IS NULL
           AND spa.song_id IS NOT NULL
           AND sca.song_id IS NOT NULL
-          AND s.song_id % 2 = %s
+          AND MOD(s.song_id, 2) = %s
         LIMIT %s
     """
     cursor.execute(query, (group, limit))
@@ -263,13 +279,14 @@ def build_batch_request_prompt(songs: List[Dict]) -> str:
 # vLLM API 调用
 # =============================================================================
 
-async def call_vllm_async(session: aiohttp.ClientSession, endpoint: str, songs: List[Dict]) -> List[Dict]:
+async def call_vllm_async(session: aiohttp.ClientSession, endpoint: str, model_name: str, songs: List[Dict]) -> List[Dict]:
     """
     异步调用 vLLM API 生成特征
 
     Args:
         session: aiohttp 会话
         endpoint: vLLM 服务端点
+        model_name: 模型名称
         songs: 歌曲列表
 
     Returns:
@@ -278,7 +295,7 @@ async def call_vllm_async(session: aiohttp.ClientSession, endpoint: str, songs: 
     prompt = build_batch_request_prompt(songs)
 
     payload = {
-        "model": "qwen",
+        "model": model_name,
         "messages": [
             {"role": "system", "content": MUSIC_FEATURE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
@@ -288,7 +305,7 @@ async def call_vllm_async(session: aiohttp.ClientSession, endpoint: str, songs: 
     }
 
     try:
-        async with session.post(endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
+        async with session.post(f"{endpoint}/v1/chat/completions", json=payload, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
                 print(f"      vLLM API 错误 {resp.status}: {error_text[:200]}")
@@ -437,7 +454,7 @@ def save_features(features_list: List[Dict], cursor, conn):
 # 主处理函数
 # =============================================================================
 
-async def process_group_async(group: int, endpoint: str, total_to_process: int):
+async def process_group_async(group: int, endpoint: str, model_name: str, total_to_process: int):
     """
     异步处理指定分组的歌曲
     """
@@ -446,7 +463,7 @@ async def process_group_async(group: int, endpoint: str, total_to_process: int):
 
     group_name = "A" if group == 0 else "B"
     print(f"\n{'='*60}")
-    print(f"处理组 {group_name} (endpoint: {endpoint})")
+    print(f"处理组 {group_name} (endpoint: {endpoint}, model: {model_name})")
     print(f"{'='*60}")
 
     success_count = 0
@@ -467,7 +484,7 @@ async def process_group_async(group: int, endpoint: str, total_to_process: int):
                 batch = songs[i:i+BATCH_SIZE]
 
                 try:
-                    features_list = await call_vllm_async(session, endpoint, batch)
+                    features_list = await call_vllm_async(session, endpoint, model_name, batch)
 
                     if features_list:
                         # 构建 inherited_tags
@@ -508,7 +525,7 @@ async def process_group_async(group: int, endpoint: str, total_to_process: int):
     return success_count, fail_count
 
 
-def init_music_feature_vllm():
+async def init_music_feature_vllm():
     """
     使用 vLLM 批量生成音乐特征
 
@@ -556,7 +573,7 @@ def init_music_feature_vllm():
             WHERE mf.id IS NULL
               AND spa.song_id IS NOT NULL
               AND sca.song_id IS NOT NULL
-              AND s.song_id % 2 = 0
+              AND MOD(s.song_id, 2) = 0
         """)
         remaining_a = cursor.fetchone()[0]
 
@@ -570,7 +587,7 @@ def init_music_feature_vllm():
             WHERE mf.id IS NULL
               AND spa.song_id IS NOT NULL
               AND sca.song_id IS NOT NULL
-              AND s.song_id % 2 = 1
+              AND MOD(s.song_id, 2) = 1
         """)
         remaining_b = cursor.fetchone()[0]
 
@@ -588,10 +605,10 @@ def init_music_feature_vllm():
         start_time = time.time()
 
         # 并行处理两组
-        results = asyncio.run(asyncio.gather(
-            process_group_async(0, VLLM_ENDPOINT_A, remaining_a),
-            process_group_async(1, VLLM_ENDPOINT_B, remaining_b)
-        ))
+        results = await asyncio.gather(
+            process_group_async(0, VLLM_ENDPOINT_A, VLLM_MODEL_A, remaining_a),
+            process_group_async(1, VLLM_ENDPOINT_B, VLLM_MODEL_B, remaining_b)
+        )
 
         total_success = sum(r[0] for r in results)
         total_fail = sum(r[1] for r in results)
@@ -637,4 +654,4 @@ def init_music_feature_vllm():
 # =============================================================================
 
 if __name__ == "__main__":
-    init_music_feature_vllm()
+    asyncio.run(init_music_feature_vllm())

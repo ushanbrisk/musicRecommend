@@ -7,9 +7,8 @@
 ## 硬件配置
 
 ```
-组 A: 2×RTX 3090 (24GB) → GPU 0, 4
-组 B: 2×RTX 3080 (20GB) → GPU 1, 2
-空闲: GPU 3, 5 (备用)
+组 A: 3×RTX 3090 (24GB) → GPU 0, 4, 5
+组 B: 3×RTX 3080 (20GB) → GPU 1, 2, 3
 ```
 
 ## 推荐模型
@@ -45,7 +44,7 @@ vLLM 需要从 HuggingFace 下载模型，有两种方式：
 # 1. 注册 HuggingFace 账号：https://huggingface.co/join
 # 2. 生成 Token：https://huggingface.co/settings/tokens
 # 3. 配置环境变量
-export HF_TOKEN="your_huggingface_token_here"
+export HF_TOKEN="xxx"
 
 # 或者使用 huggingface-cli
 pip install huggingface-hub
@@ -90,11 +89,11 @@ export HF_HOME="/path/to/your/model/cache"
 
 ```bash
 # PostgreSQL 配置
-PG_HOST=localhost
-PG_PORT=5432
-PG_DB=musicdb
-PG_USER=postgres
-PG_PASSWORD=luke
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=musicdb
+DB_USER=postgres
+DB_PASSWORD=luke
 
 # vLLM 配置（可选，使用默认值）
 VLLM_ENDPOINT_A=http://localhost:8000/v1/chat/completions
@@ -249,8 +248,8 @@ nvidia-smi -L
 
 # 2. 检查 GPU 分配是否正确
 # 编辑 scripts/start_vllm_servers.sh
-GPU_GROUP_A="0,4"  # 2×RTX 3090
-GPU_GROUP_B="1,2"  # 2×RTX 3080
+GPU_GROUP_A="0,4,5"  # 确保这些 GPU 存在
+GPU_GROUP_B="1,2,3"
 
 # 3. 检查 CUDA 驱动
 nvidia-smi
@@ -321,8 +320,8 @@ export HF_HOME="/path/to/ssd/huggingface"
 ### 2. 启用 Tensor Parallelism
 
 已在启动脚本中启用：
-- 组 A：TP=2（2 块 GPU）
-- 组 B：TP=2（2 块 GPU）
+- 组 A：TP=3（3 块 GPU）
+- 组 B：TP=3（3 块 GPU）
 
 ### 3. 调整批量参数
 
@@ -387,9 +386,9 @@ PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c \
     ┌───────────▼──────────┐     ┌───────────▼──────────┐
     │   vLLM 组 A 服务     │     │   vLLM 组 B 服务     │
     │   Port: 8000        │     │   Port: 8001        │
-    │   2×RTX 3090        │     │   2×RTX 3080        │
+    │   3×RTX 3090        │     │   3×RTX 3080        │
     │   Qwen2.5-32B       │     │   Qwen2.5-14B       │
-    │   TP=2, AWQ Int4    │     │   TP=2, AWQ Int4    │
+    │   TP=3, AWQ Int4    │     │   TP=3, AWQ Int4    │
     └───────────┬──────────┘     └───────────┬──────────┘
                 │                             │
                 └──────────────┬──────────────┘
@@ -406,10 +405,10 @@ PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c \
 |------|--------|----------------|
 | 总处理歌曲数 | 120,000 | - |
 | 批量大小 | 20 首/批 | - |
-| 组 A 吞吐量 | 30-50 songs/s | - |
-| 组 B 吞吐量 | 50-70 songs/s | - |
-| **总吞吐量** | **80-120 songs/s** | - |
-| **预计总耗时** | **15-25 分钟** | - |
+| 组 A 吞吐量 | 60-80 songs/s | - |
+| 组 B 吞吐量 | 80-100 songs/s | - |
+| **总吞吐量** | **140-180 songs/s** | - |
+| **预计总耗时** | **11-14 分钟** | - |
 | GPU 利用率 | > 80% | - |
 | 成功率 | > 99% | - |
 

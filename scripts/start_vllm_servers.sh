@@ -14,6 +14,9 @@
 
 set -e
 
+# 确保 GPU 顺序一致（按 PCI 总线 ID 排序）
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
 # 配置
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
