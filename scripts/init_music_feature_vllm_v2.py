@@ -67,11 +67,96 @@ def get_vllm_model(endpoint: str) -> str:
 
 VLLM_MODEL = get_vllm_model(VLLM_ENDPOINT)
 
-# 批量配置
-BATCH_SIZE = int(os.getenv('VLLM_BATCH_SIZE', '2'))  # 每批歌曲数
-MAX_TOKENS = 2048
+# 批量配置 - 支持动态调整
+INITIAL_BATCH_SIZE = int(os.getenv('VLLM_BATCH_SIZE', '10'))  # 初始每批歌曲数
+MIN_BATCH_SIZE = 2  # 最小 batch_size
+MAX_BATCH_SIZE = int(os.getenv('VLLM_MAX_BATCH_SIZE', '20'))  # 最大每批歌曲数
+MAX_TOKENS = 1024  # 减少输出长度以加快速度
 TEMPERATURE = 0.3
 REQUEST_TIMEOUT = 180  # 秒
+
+# 连续失败跳过配置
+MAX_FAIL_COUNT = 5  # 连续失败 5 次后跳过该歌曲
+
+# 动态 batch_size 配置
+CURRENT_BATCH_SIZE = INITIAL_BATCH_SIZE
+CONTINUOUS_SUCCESS_COUNT = 0  # 连续成功计数
+CONTINUOUS_FAIL_COUNT = 0  # 连续失败计数
+
+
+def ensure_skip_table_exists(conn):
+    """
+    确保跳过记录表存在
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS music_features_skip (
+            song_id VARCHAR(64) PRIMARY KEY,
+            fail_reason TEXT,
+            fail_count INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    cursor.close()
+
+
+def get_songs_without_features(cursor, limit: int = 100) -> List[Dict]:
+    """
+    获取尚未生成特征的歌曲（按文本内容长度升序排序，排除已跳过的歌曲）
+
+    使用预聚合表 song_playlist_agg 和 song_comment_agg，避免实时 JOIN
+    按 (playlist_names_str + playlist_categories_str + comment_summary) 长度升序排序
+    这样开始时可以用较大的 batch_size，后面内容变长时自动适应
+    """
+    query = """
+        SELECT
+            s.song_id,
+            s.song_name,
+            s.artist,
+            s.album,
+            COALESCE(spa.playlist_names_str, '') as playlist_names_str,
+            COALESCE(spa.playlist_categories_str, '') as playlist_categories_str,
+            COALESCE(sca.comment_summary, '') as comment_summary,
+            COALESCE(sca.avg_polarity, 0) as avg_polarity,
+            LENGTH(spa.playlist_names_str) + LENGTH(spa.playlist_categories_str) + LENGTH(sca.comment_summary) as content_length
+        FROM songs s
+        LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
+        LEFT JOIN song_comment_agg sca ON s.song_id = sca.song_id
+        LEFT JOIN music_features mf ON s.song_id = mf.song_id
+        LEFT JOIN music_features_skip sk ON s.song_id = sk.song_id
+        WHERE mf.id IS NULL
+          AND sk.song_id IS NULL
+          AND spa.song_id IS NOT NULL
+          AND sca.song_id IS NOT NULL
+        ORDER BY content_length ASC
+        LIMIT %s
+    """
+    cursor.execute(query, (limit,))
+    columns = [desc[0] for desc in cursor.description]
+    results = []
+    for row in cursor.fetchall():
+        results.append(dict(zip(columns, row)))
+    return results
+
+
+def mark_song_skipped(conn, song_id: int, fail_reason: str):
+    """
+    标记歌曲为跳过状态
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO music_features_skip (song_id, fail_reason, fail_count, updated_at)
+        VALUES (%s, %s, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT (song_id) DO UPDATE SET
+            fail_reason = EXCLUDED.fail_reason,
+            fail_count = music_features_skip.fail_count + 1,
+            updated_at = CURRENT_TIMESTAMP
+    """, (song_id, fail_reason))
+    conn.commit()
+    cursor.close()
+
 
 # 音乐特征系统提示词
 MUSIC_FEATURE_SYSTEM_PROMPT = """你是一个专业的音乐分析师，负责根据歌曲的文本信息生成音乐特征。
@@ -128,78 +213,6 @@ def get_db_connection():
 # =============================================================================
 # 数据获取
 # =============================================================================
-
-def get_songs_without_features(cursor, limit: int = 100) -> List[Dict]:
-    """
-    获取尚未生成特征的歌曲
-
-    使用预聚合表 song_playlist_agg 和 song_comment_agg，避免实时 JOIN
-    每首歌曲的评论已被压缩到 5 条以内，上下文长度可控
-    """
-    query = """
-        SELECT
-            s.song_id,
-            s.song_name,
-            s.artist,
-            s.album,
-            COALESCE(spa.playlist_names_str, '') as playlist_names_str,
-            COALESCE(spa.playlist_categories_str, '') as playlist_categories_str,
-            COALESCE(sca.comment_summary, '') as comment_summary,
-            COALESCE(sca.avg_polarity, 0) as avg_polarity
-        FROM songs s
-        LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
-        LEFT JOIN song_comment_agg sca ON s.song_id = sca.song_id
-        LEFT JOIN music_features mf ON s.song_id = mf.song_id
-        WHERE mf.id IS NULL
-          AND (
-              spa.song_id IS NOT NULL
-              AND sca.song_id IS NOT NULL
-          )
-        LIMIT %s
-    """
-    cursor.execute(query, (limit,))
-    columns = [desc[0] for desc in cursor.description]
-    results = []
-    for row in cursor.fetchall():
-        results.append(dict(zip(columns, row)))
-    return results
-
-
-def get_songs_without_features_for_group(cursor, group: int, limit: int = 100) -> List[Dict]:
-    """
-    获取指定分组的待处理歌曲
-
-    Args:
-        cursor: 数据库游标
-        group: 分组编号 (0 或 1)
-        limit: 获取数量限制
-    """
-    query = """
-        SELECT
-            s.song_id,
-            s.song_name,
-            s.artist,
-            s.album,
-            COALESCE(spa.playlist_names_str, '') as playlist_names_str,
-            COALESCE(spa.playlist_categories_str, '') as playlist_categories_str,
-            COALESCE(sca.comment_summary, '') as comment_summary,
-            COALESCE(sca.avg_polarity, 0) as avg_polarity
-        FROM songs s
-        LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
-        LEFT JOIN song_comment_agg sca ON s.song_id = sca.song_id
-        LEFT JOIN music_features mf ON s.song_id = mf.song_id
-        WHERE mf.id IS NULL
-          AND spa.song_id IS NOT NULL
-          AND sca.song_id IS NOT NULL
-          AND MOD(s.song_id, 2) = %s
-        LIMIT %s
-    """
-    cursor.execute(query, (group, limit))
-    columns = [desc[0] for desc in cursor.description]
-    results = []
-    for row in cursor.fetchall():
-        results.append(dict(zip(columns, row)))
-    return results
 
 
 # =============================================================================
@@ -451,33 +464,94 @@ def save_features(features_list: List[Dict], cursor, conn):
 # 主处理函数
 # =============================================================================
 
+def adjust_batch_size(success: bool, error_msg: str = ""):
+    """
+    动态调整 batch_size
+
+    - 连续成功时，逐步增加 batch_size
+    - 失败时（包括 context overflow），减少 batch_size
+    - 溢出错误优先处理
+    """
+    global CURRENT_BATCH_SIZE, CONTINUOUS_SUCCESS_COUNT, CONTINUOUS_FAIL_COUNT
+
+    # 检测是否是 context overflow 错误
+    is_overflow = "maximum context length" in error_msg.lower() or "requested" in error_msg.lower() and "tokens" in error_msg.lower()
+
+    if success:
+        CONTINUOUS_SUCCESS_COUNT += 1
+        CONTINUOUS_FAIL_COUNT = 0
+
+        # 连续成功 5 次，尝试增加 batch_size
+        if CONTINUOUS_SUCCESS_COUNT >= 5:
+            if CURRENT_BATCH_SIZE < MAX_BATCH_SIZE:
+                old_size = CURRENT_BATCH_SIZE
+                CURRENT_BATCH_SIZE = min(CURRENT_BATCH_SIZE + 1, MAX_BATCH_SIZE)
+                CONTINUOUS_SUCCESS_COUNT = 0
+                if CURRENT_BATCH_SIZE > old_size:
+                    print(f"      [自适应] batch_size: {old_size} → {CURRENT_BATCH_SIZE} (连续成功)")
+    else:
+        CONTINUOUS_SUCCESS_COUNT = 0
+        CONTINUOUS_FAIL_COUNT += 1
+
+        if is_overflow:
+            # 溢出错误，直接减半
+            if CURRENT_BATCH_SIZE > MIN_BATCH_SIZE:
+                old_size = CURRENT_BATCH_SIZE
+                CURRENT_BATCH_SIZE = max(MIN_BATCH_SIZE, CURRENT_BATCH_SIZE // 2)
+                print(f"      [自适应] batch_size: {old_size} → {CURRENT_BATCH_SIZE} (context overflow)")
+        elif CONTINUOUS_FAIL_COUNT >= 2:
+            # 连续失败 2 次，减少 batch_size
+            if CURRENT_BATCH_SIZE > MIN_BATCH_SIZE:
+                old_size = CURRENT_BATCH_SIZE
+                CURRENT_BATCH_SIZE = max(MIN_BATCH_SIZE, CURRENT_BATCH_SIZE - 1)
+                print(f"      [自适应] batch_size: {old_size} → {CURRENT_BATCH_SIZE} (连续失败)")
+
+
+def is_context_overflow_error(error_msg: str) -> bool:
+    """检测是否是 context overflow 错误"""
+    error_lower = error_msg.lower()
+    return ("maximum context length" in error_lower or
+            ("requested" in error_lower and "tokens" in error_lower and "exceeds" in error_lower))
+
+
 async def process_all_async(total_to_process: int):
     """
-    异步处理所有歌曲（单一大模型）
+    异步处理所有歌曲（单一大模型，动态 batch_size）
     """
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    global CURRENT_BATCH_SIZE
+    CURRENT_BATCH_SIZE = INITIAL_BATCH_SIZE  # 重置 batch_size
+
     print(f"\n{'='*60}")
     print(f"处理全部歌曲 (endpoint: {VLLM_ENDPOINT}, model: {VLLM_MODEL})")
     print(f"{'='*60}")
+    print(f"  初始 batch_size: {INITIAL_BATCH_SIZE}")
+    print(f"  动态范围: {MIN_BATCH_SIZE} ~ {MAX_BATCH_SIZE}")
+    print(f"  连续失败跳过阈值: {MAX_FAIL_COUNT} 次")
 
     success_count = 0
     fail_count = 0
     start_time = time.time()
 
+    # 跟踪每首歌曲的失败次数
+    song_fail_count = {}  # song_id -> fail_count
+    skipped_songs = set()  # 已跳过的歌曲集合
+
     async with aiohttp.ClientSession() as session:
         while True:
-            # 获取待处理歌曲（不分组，全部处理）
-            songs = get_songs_without_features(cursor, limit=BATCH_SIZE * 10)
+            # 获取待处理歌曲（按内容长度升序，每次获取当前 batch_size 的 10 倍用于缓冲）
+            fetch_limit = CURRENT_BATCH_SIZE * 10
+            songs = get_songs_without_features(cursor, limit=fetch_limit)
             if not songs:
                 break
 
-            print(f"\n  批次开始 (获取 {len(songs)} 首)...")
+            print(f"\n  批次开始 (获取 {len(songs)} 首, batch_size={CURRENT_BATCH_SIZE})...")
 
             # 分批调用 vLLM
-            for i in range(0, len(songs), BATCH_SIZE):
-                batch = songs[i:i+BATCH_SIZE]
+            for i in range(0, len(songs), CURRENT_BATCH_SIZE):
+                batch = songs[i:i+CURRENT_BATCH_SIZE]
 
                 try:
                     features_list = await call_vllm_async(session, VLLM_ENDPOINT, VLLM_MODEL, batch)
@@ -492,14 +566,45 @@ async def process_all_async(total_to_process: int):
 
                         save_features(features_list, cursor, conn)
                         success_count += len(features_list)
+                        adjust_batch_size(success=True)
+
+                        # 成功时清除失败记录
+                        for song in batch:
+                            song_id = str(song['song_id'])
+                            if song_id in song_fail_count:
+                                del song_fail_count[song_id]
                     else:
-                        # vLLM 调用失败，标记为失败
+                        # vLLM 调用失败 - 追踪每首歌曲的失败
+                        for song in batch:
+                            song_id = str(song['song_id'])
+                            song_fail_count[song_id] = song_fail_count.get(song_id, 0) + 1
+
+                            if song_fail_count[song_id] >= MAX_FAIL_COUNT and song_id not in skipped_songs:
+                                reason = f"连续失败 {song_fail_count[song_id]} 次 (vLLM API error)"
+                                mark_song_skipped(conn, song['song_id'], reason)
+                                skipped_songs.add(song_id)
+                                print(f"      跳过歌曲 {song_id} (已连续失败 {song_fail_count[song_id]} 次)")
+
                         fail_count += len(batch)
-                        print(f"      批次 {i//BATCH_SIZE + 1} 失败")
+                        print(f"      批次 {i//CURRENT_BATCH_SIZE + 1} 失败")
+                        adjust_batch_size(success=False, error_msg="vLLM API error")
 
                 except Exception as e:
+                    # 处理异常 - 追踪每首歌曲的失败
+                    for song in batch:
+                        song_id = str(song['song_id'])
+                        song_fail_count[song_id] = song_fail_count.get(song_id, 0) + 1
+
+                        if song_fail_count[song_id] >= MAX_FAIL_COUNT and song_id not in skipped_songs:
+                            reason = f"连续失败 {song_fail_count[song_id]} 次: {str(e)[:100]}"
+                            mark_song_skipped(conn, song['song_id'], reason)
+                            skipped_songs.add(song_id)
+                            print(f"      跳过歌曲 {song_id} (已连续失败 {song_fail_count[song_id]} 次)")
+
                     fail_count += len(batch)
-                    print(f"      批次处理异常: {e}")
+                    error_msg = str(e)
+                    print(f"      批次处理异常: {error_msg}")
+                    adjust_batch_size(success=False, error_msg=error_msg)
 
                 # 进度显示
                 elapsed = time.time() - start_time
@@ -517,6 +622,7 @@ async def process_all_async(total_to_process: int):
     print(f"  - 成功: {success_count}")
     print(f"  - 失败: {fail_count}")
     print(f"  - 耗时: {elapsed:.1f} 秒")
+    print(f"  - 最终 batch_size: {CURRENT_BATCH_SIZE}")
 
     return success_count, fail_count
 
@@ -526,11 +632,16 @@ async def init_music_feature_vllm():
     使用 vLLM 批量生成音乐特征（单一大模型版本）
 
     所有歌曲共用一个 vLLM 服务 (TP=5)
+    动态 batch_size 根据内容长度和错误情况自适应调整
     """
+    global CURRENT_BATCH_SIZE
+
     print("=" * 60)
-    print("vLLM 批量特征生成开始 (单一大模型 TP=5)")
+    print("vLLM 批量特征生成开始 (单一大模型 TP=5, 动态 batch_size)")
     print("=" * 60)
-    print(f"  批大小: {BATCH_SIZE} 首/批")
+    print(f"  初始 batch_size: {INITIAL_BATCH_SIZE}")
+    print(f"  最大 batch_size: {MAX_BATCH_SIZE}")
+    print(f"  最小 batch_size: {MIN_BATCH_SIZE}")
     print(f"  端点: {VLLM_ENDPOINT}")
     print(f"  模型: {VLLM_MODEL}")
     print()
@@ -539,6 +650,13 @@ async def init_music_feature_vllm():
     cursor = conn.cursor()
 
     try:
+        # 0. 确保跳过表存在
+        print("[0/4] 初始化跳过表...")
+        ensure_skip_table_exists(conn)
+        cursor.execute("SELECT COUNT(*) FROM music_features_skip")
+        skip_count = cursor.fetchone()[0]
+        print(f"      music_features_skip: {skip_count:,} 条 (已跳过的歌曲)")
+
         # 1. 检查预聚合表
         print("[1/4] 检查预聚合表数据...")
         cursor.execute("SELECT COUNT(*) FROM song_playlist_agg")
@@ -555,7 +673,7 @@ async def init_music_feature_vllm():
             return
 
         # 2. 统计待处理歌曲
-        print("\n[2/4] 统计待处理歌曲...")
+        print("[2/5] 统计待处理歌曲...")
 
         cursor.execute("""
             SELECT COUNT(*)
@@ -576,7 +694,7 @@ async def init_music_feature_vllm():
             return
 
         # 3. 启动 vLLM 批量处理
-        print("\n[3/4] 启动 vLLM 批量处理...")
+        print("[5/5] 启动 vLLM 批量处理...")
 
         start_time = time.time()
 
@@ -584,7 +702,7 @@ async def init_music_feature_vllm():
         success_count, fail_count = await process_all_async(total_to_process)
 
         # 4. 验证结果
-        print("\n[4/4] 验证结果...")
+        print("[4/5] 验证结果...")
         cursor.execute("SELECT COUNT(*) FROM music_features")
         total_features = cursor.fetchone()[0]
 
