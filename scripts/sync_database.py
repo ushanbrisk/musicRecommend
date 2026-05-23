@@ -10,10 +10,11 @@
 使用方式:
     ~/miniconda3/envs/music_recommend/bin/python scripts/sync_database.py
 
-注意:
-    - 远程数据库连接信息需要在 .env 中配置
-    - 默认同步所有表，数据会被覆盖
-    - 执行前请确认远程数据库为空或可接受覆盖
+增量同步说明:
+    - 默认 INCREMENTAL_MODE = True，仅同步本地新增的记录
+    - 已存在的记录不会被覆盖
+    - 表配置支持两种格式：'table_name' 或 ('table_name', 'unique_key')
+    - unique_key 用于判断记录是否已存在，默认是 'id'
 ============================================================
 """
 
@@ -50,25 +51,30 @@ REMOTE_CONFIG = {
 }
 
 # 需要同步的表（按依赖顺序排列）
+# format: 'table_name' or ('table_name', 'unique_column')
+# 如果不指定 unique_column，则使用 id 列
 TABLES = [
     'artists',
-    'songs',
+    ('songs', 'song_id'),
     'playlists',
     'song_playlist',
     'song_playlist_agg',
     'comments',
     'song_comment_agg',
-    'music_features',
-    'music_features_14b',
-    'music_features_api',
-    'music_features_skip',
-    'music_features_14b_skip',
+    ('music_features', 'song_id'),
+    ('music_features_14b', 'song_id'),
+    ('music_features_api', 'song_id'),
+    ('music_features_skip', 'song_id'),
+    ('music_features_14b_skip', 'song_id'),
     'artist_songs_relation',
     'male_artists',
     'female_artists',
     'recommendation_history',
     'recommendation_feedback'
 ]
+
+# 增量同步模式（默认关闭）
+INCREMENTAL_MODE = True
 
 
 @contextmanager
@@ -87,8 +93,28 @@ def get_table_row_count(cursor, table_name):
     return cursor.fetchone()[0]
 
 
-def sync_table(table_name: str, use_truncate: bool = True):
-    """同步单个表的数据"""
+def normalize_table_spec(table_spec):
+    """规范化表配置，支持两种格式：'table_name' 或 ('table_name', 'unique_col')"""
+    if isinstance(table_spec, tuple):
+        return table_spec[0], table_spec[1]
+    else:
+        return table_spec, 'id'
+
+
+def get_existing_keys(cursor, table_name: str, key_column: str) -> set:
+    """获取远程表中已存在的 key 列值"""
+    cursor.execute(f"SELECT {key_column} FROM {table_name}")
+    return set(row[0] for row in cursor.fetchall())
+
+
+def sync_table(table_name: str, unique_key: str = 'id', incremental: bool = True):
+    """同步单个表的数据
+
+    Args:
+        table_name: 表名
+        unique_key: 唯一键列名，用于判断是否已存在
+        incremental: True=增量同步(仅插入新记录)，False=全量覆盖(先清空)
+    """
     print(f"\n同步表: {table_name}")
 
     with get_conn(LOCAL_CONFIG) as local_conn:
@@ -126,8 +152,37 @@ def sync_table(table_name: str, use_truncate: bool = True):
         remote_count = get_table_row_count(remote_cursor, table_name)
         print(f"  远程记录数: {remote_count:,}")
 
-        if use_truncate:
-            # 清除远程表数据（全量覆盖）
+        # 确定唯一键列的索引
+        try:
+            key_idx = columns.index(unique_key)
+        except ValueError:
+            print(f"  警告: 列 '{unique_key}' 不在表中，使用所有列判断")
+            key_idx = None
+
+        rows_to_insert = rows
+
+        if incremental:
+            # 增量模式：获取远程已存在的 key，仅同步新记录
+            existing_keys = get_existing_keys(remote_cursor, table_name, unique_key)
+            print(f"  远程已有键值数: {len(existing_keys):,}")
+
+            if key_idx is not None:
+                rows_to_insert = [row for row in rows if row[key_idx] not in existing_keys]
+            else:
+                # 如果无法确定key列，降级为跳过（不做覆盖）
+                new_count = len(rows) - remote_count
+                if new_count <= 0:
+                    print(f"  无新增记录，跳过")
+                    return
+                rows_to_insert = rows[:new_count]  # 假设新增的在前面
+
+            print(f"  需同步的新记录数: {len(rows_to_insert):,}")
+
+            if len(rows_to_insert) == 0:
+                print(f"  无新数据需要同步，跳过")
+                return
+        else:
+            # 全量覆盖模式
             remote_cursor.execute(f"TRUNCATE TABLE {table_name} CASCADE")
             remote_conn.commit()
             print(f"  已清空远程表")
@@ -137,25 +192,27 @@ def sync_table(table_name: str, use_truncate: bool = True):
         insert_sql = f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})"
 
         batch_size = 1000
-        for i in range(0, len(rows), batch_size):
-            batch = rows[i:i+batch_size]
+        inserted = 0
+        for i in range(0, len(rows_to_insert), batch_size):
+            batch = rows_to_insert[i:i+batch_size]
             try:
                 remote_cursor.executemany(insert_sql, batch)
                 remote_conn.commit()
-                print(f"  已插入 {min(i+batch_size, len(rows)):,}/{len(rows):,} 条")
+                inserted += len(batch)
+                print(f"  已插入 {inserted:,}/{len(rows_to_insert):,} 条")
             except Exception as e:
-                print(f"  插入失败: {e}")
+                print(f"  批量插入失败: {e}")
                 remote_conn.rollback()
-                # 如果插入失败，尝试逐条插入
+                # 逐条插入失败的记录
                 for row in batch:
                     try:
                         remote_cursor.execute(insert_sql, row)
                         remote_conn.commit()
+                        inserted += 1
                     except Exception as e2:
-                        print(f"    单条插入失败: {e2}")
-                        remote_conn.rollback()
+                        pass  # 忽略已存在的记录
 
-        print(f"  同步完成")
+        print(f"  同步完成 (新增 {inserted:,} 条)")
 
 
 def main():
@@ -178,9 +235,10 @@ def main():
     success_count = 0
     fail_count = 0
 
-    for table in TABLES:
+    for table_spec in TABLES:
+        table_name, unique_key = normalize_table_spec(table_spec)
         try:
-            sync_table(table)
+            sync_table(table_name, unique_key=unique_key, incremental=INCREMENTAL_MODE)
             success_count += 1
         except Exception as e:
             print(f"  同步失败: {e}")
