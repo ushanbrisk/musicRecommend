@@ -33,7 +33,7 @@ mkdir -p "$LOG_DIR"
 MODEL="Qwen/Qwen2.5-32B-Instruct-AWQ"
 TP=4
 PORT=8000
-GPU_IDS="0,1,2,4"
+GPU_IDS="0,1,4,5"
 
 # 通用配置
 QUANTIZATION="awq"

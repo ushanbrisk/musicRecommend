@@ -120,12 +120,12 @@ def get_songs_without_features(cursor, limit: int = 100) -> List[Dict]:
             COALESCE(spa.playlist_categories_str, '') as playlist_categories_str,
             COALESCE(sca.comment_summary, '') as comment_summary,
             COALESCE(sca.avg_polarity, 0) as avg_polarity,
-            LENGTH(spa.playlist_names_str) + LENGTH(spa.playlist_categories_str) + LENGTH(sca.comment_summary) as content_length
+            LENGTH(COALESCE(spa.playlist_names_str, '')) + LENGTH(COALESCE(spa.playlist_categories_str, '')) + LENGTH(COALESCE(sca.comment_summary, '')) as content_length
         FROM songs s
         LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
         LEFT JOIN song_comment_agg sca ON s.song_id = sca.song_id
         LEFT JOIN music_features mf ON s.song_id = mf.song_id
-        LEFT JOIN music_features_skip sk ON s.song_id = sk.song_id
+        LEFT JOIN music_features_skip sk ON s.song_id::text = sk.song_id
         WHERE mf.id IS NULL
           AND sk.song_id IS NULL
           AND spa.song_id IS NOT NULL
@@ -153,7 +153,7 @@ def mark_song_skipped(conn, song_id: int, fail_reason: str):
             fail_reason = EXCLUDED.fail_reason,
             fail_count = music_features_skip.fail_count + 1,
             updated_at = CURRENT_TIMESTAMP
-    """, (song_id, fail_reason))
+    """, (str(song_id), fail_reason))
     conn.commit()
     cursor.close()
 
@@ -673,7 +673,7 @@ async def init_music_feature_vllm():
             return
 
         # 2. 统计待处理歌曲
-        print("[2/5] 统计待处理歌曲...")
+        print("[2/4] 统计待处理歌曲...")
 
         cursor.execute("""
             SELECT COUNT(*)
@@ -694,7 +694,7 @@ async def init_music_feature_vllm():
             return
 
         # 3. 启动 vLLM 批量处理
-        print("[5/5] 启动 vLLM 批量处理...")
+        print("[3/4] 启动 vLLM 批量处理...")
 
         start_time = time.time()
 
@@ -702,7 +702,7 @@ async def init_music_feature_vllm():
         success_count, fail_count = await process_all_async(total_to_process)
 
         # 4. 验证结果
-        print("[4/5] 验证结果...")
+        print("[4/4] 验证结果...")
         cursor.execute("SELECT COUNT(*) FROM music_features")
         total_features = cursor.fetchone()[0]
 
