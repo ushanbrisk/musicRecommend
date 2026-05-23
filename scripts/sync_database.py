@@ -104,7 +104,9 @@ def normalize_table_spec(table_spec):
 def get_existing_keys(cursor, table_name: str, key_column: str) -> set:
     """获取远程表中已存在的 key 列值"""
     cursor.execute(f"SELECT {key_column} FROM {table_name}")
-    return set(row[0] for row in cursor.fetchall())
+    keys = set(row[0] for row in cursor.fetchall())
+    print(f"  获取远程 {key_column} 完成，共 {len(keys):,} 个")
+    return keys
 
 
 def sync_table(table_name: str, unique_key: str = 'id', incremental: bool = True):
@@ -151,6 +153,7 @@ def sync_table(table_name: str, unique_key: str = 'id', incremental: bool = True
 
         remote_count = get_table_row_count(remote_cursor, table_name)
         print(f"  远程记录数: {remote_count:,}")
+        print(f"  增量模式: {incremental}")
 
         # 确定唯一键列的索引
         try:
@@ -168,6 +171,7 @@ def sync_table(table_name: str, unique_key: str = 'id', incremental: bool = True
 
             if key_idx is not None:
                 rows_to_insert = [row for row in rows if row[key_idx] not in existing_keys]
+                print(f"  过滤后待插入: {len(rows_to_insert):,} 条 (远程已有 {len(existing_keys):,} 个唯一键)")
             else:
                 # 如果无法确定key列，降级为跳过（不做覆盖）
                 new_count = len(rows) - remote_count
@@ -193,6 +197,7 @@ def sync_table(table_name: str, unique_key: str = 'id', incremental: bool = True
 
         batch_size = 1000
         inserted = 0
+        skipped = 0
         for i in range(0, len(rows_to_insert), batch_size):
             batch = rows_to_insert[i:i+batch_size]
             try:
@@ -201,7 +206,7 @@ def sync_table(table_name: str, unique_key: str = 'id', incremental: bool = True
                 inserted += len(batch)
                 print(f"  已插入 {inserted:,}/{len(rows_to_insert):,} 条")
             except Exception as e:
-                print(f"  批量插入失败: {e}")
+                print(f"  批量插入失败: {e}, 尝试逐条插入...")
                 remote_conn.rollback()
                 # 逐条插入失败的记录
                 for row in batch:
@@ -210,9 +215,11 @@ def sync_table(table_name: str, unique_key: str = 'id', incremental: bool = True
                         remote_conn.commit()
                         inserted += 1
                     except Exception as e2:
-                        pass  # 忽略已存在的记录
+                        skipped += 1
+                        if skipped <= 5:
+                            print(f"    跳过 (id={row[0] if len(row) > 0 else '?'}): {e2}")
 
-        print(f"  同步完成 (新增 {inserted:,} 条)")
+        print(f"  同步完成 (新增 {inserted:,} 条, 跳过 {skipped:,} 条)")
 
 
 def main():
