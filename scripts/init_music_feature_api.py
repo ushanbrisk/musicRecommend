@@ -215,8 +215,10 @@ def extract_features_batch(songs: list, llm_client, model_name: str) -> list:
 
 
 def get_songs_without_features(cursor, limit: int = 100):
-    """获取尚未生成特征的歌曲"""
+    """获取尚未生成特征的歌曲（按文本长度升序排序）"""
     # 使用预聚合表 song_playlist_agg 和 song_comment_agg，避免实时 JOIN
+    # 按 (playlist_names_str + playlist_categories_str + comment_summary) 长度升序排序
+    # 这样开始时可以用较短的 prompt，后面内容变长时自动适应
     query = """
         SELECT
             s.song_id,
@@ -226,17 +228,21 @@ def get_songs_without_features(cursor, limit: int = 100):
             COALESCE(spa.playlist_names_str, '') as playlist_names_str,
             COALESCE(spa.playlist_categories_str, '') as playlist_categories_str,
             COALESCE(sca.comment_summary, '') as comment_summary,
-            COALESCE(sca.avg_polarity, 0) as avg_polarity
+            COALESCE(sca.avg_polarity, 0) as avg_polarity,
+            LENGTH(COALESCE(spa.playlist_names_str, '')) +
+            LENGTH(COALESCE(spa.playlist_categories_str, '')) +
+            LENGTH(COALESCE(sca.comment_summary, '')) as content_length
         FROM songs s
         LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
         LEFT JOIN song_comment_agg sca ON s.song_id = sca.song_id
-        LEFT JOIN music_features mf ON s.song_id = mf.song_id
+        LEFT JOIN music_features_api mf ON s.song_id = mf.song_id
         WHERE mf.id IS NULL
           AND (
               -- 只处理有歌单或评论数据的歌曲
               spa.song_id IS NOT NULL
               AND sca.song_id IS NOT NULL
           )
+        ORDER BY content_length ASC
         LIMIT %s
     """
     cursor.execute(query, (limit,))
@@ -250,7 +256,7 @@ def get_songs_without_features(cursor, limit: int = 100):
 def save_feature(features: dict, cursor):
     """保存特征到数据库（upsert 模式）"""
     query = """
-        INSERT INTO music_features (
+        INSERT INTO music_features_api (
             song_id, genre, mood, tempo, instruments,
             scene, language, era, description,
             emotional_tags, theme_keywords, inherited_tags,
@@ -320,7 +326,7 @@ def init_music_feature():
         cursor.execute("""
             SELECT COUNT(*)
             FROM songs s
-            LEFT JOIN music_features mf ON s.song_id = mf.song_id
+            LEFT JOIN music_features_api mf ON s.song_id = mf.song_id
             LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
             LEFT JOIN song_comment_agg sca ON s.song_id = sca.song_id
             WHERE mf.id IS NULL
@@ -418,7 +424,7 @@ def init_music_feature():
 
         # 4. 验证结果
         print("\n[4/4] 验证数据...")
-        cursor.execute("SELECT COUNT(*) FROM music_features")
+        cursor.execute("SELECT COUNT(*) FROM music_features_api")
         total_features = cursor.fetchone()[0]
 
         print(f"\n{'=' * 60}")
@@ -426,7 +432,7 @@ def init_music_feature():
         print(f"  - 总处理数:           {total_processed:,}")
         print(f"  - 成功:               {success_count:,}")
         print(f"  - 失败:               {fail_count:,}")
-        print(f"  - music_features 表:  {total_features:,}")
+        print(f"  - music_features_api 表:  {total_features:,}")
         print(f"  - 总耗时:             {elapsed:.1f} 秒")
         print(f"  - 平均速度:           {success_count/elapsed:.2f} 首/秒")
         print(f"{'=' * 60}")
@@ -435,7 +441,7 @@ def init_music_feature():
         print("\n样例数据:")
         cursor.execute("""
             SELECT song_id, genre, mood, scene
-            FROM music_features
+            FROM music_features_api
             LIMIT 3
         """)
         for row in cursor.fetchall():
