@@ -279,333 +279,76 @@ LIMIT 100;
 4. **不污染原始表**：中间表独立存在，不修改 songs、playlists 等原始表结构
 
 **涉及场景**：
-- `songs` + `playlists`（通过 `song_playlist` 关联）的歌单名称聚合
-- `songs` + `comments`（MongoDB）的评论内容聚合
+- `songs` + `playlists`（通过 `song_playlist` 关联）的歌单名称聚合 → `song_playlist_agg`
+- `songs` + `comments`（MongoDB）的评论内容聚合 → `song_comment_agg`
 
 ---
 
-### 3.0.1 新增表：歌曲-歌单预聚合表 (song_playlist_agg)
-
-将 `songs` 通过 `song_playlist` 关联 `playlists` 的结果预先聚合存储。
-
-> **📋 快速执行**：创建表的 SQL 语句已写入 `database/schema.sql`，执行以下命令即可创建：
-> ```bash
-> psql -h localhost -U postgres -d musicdb -f /home/luke/code_project/musicRecommend/database/schema.sql
-> ```
-> 详细步骤见 **6.2.1 节**。
-
-**数据样例**：
-
-| song_id | playlist_names | playlist_categories | playlist_count |
-|---------|----------------|---------------------|-----------------|
-| 1893728473 | {宁静致远, 放松身心, 深夜独酌} | {古典, 深夜} | 3 |
-| 1457702766 | {凯尔特风情, 战斗音乐} | {凯尔特, 运动} | 2 |
-
-
-**使用场景**：
-- 特征生成时，获取歌曲的歌单信息：直接 `SELECT * FROM song_playlist_agg WHERE song_id = ?`
-- 推荐时，快速获取候选歌曲的上下文：JOIN `music_features` 时无需再 JOIN `song_playlist`
-
----
-
-### 3.0.2 新增表：歌曲-评论预聚合表 (song_comment_agg)
-
-将 `songs` 在 MongoDB 中的评论信息预先聚合存储（可选，但建议实现）。
-
-> **📋 快速执行**：创建表的 SQL 语句已写入 `database/schema.sql`，执行以下命令即可创建：
-> ```bash
-> psql -h localhost -U postgres -d musicdb -f /home/luke/code_project/musicRecommend/database/schema.sql
-> ```
-> 详细步骤见 **6.2.1 节**。
-
-**数据样例**：
-
-| song_id | comment_count | top_comments | avg_polarity |
-|---------|---------------|--------------|--------------|
-| 1893728473 | 1523 | {这曲子太美了..., 战斗进行曲...} | 0.72 |
-
----
-
-### 3.0.3 预计算表 vs 实时查询对比
-
-| 查询场景 | 实时查询（优化前） | 预计算表（优化后） |
-|----------|-------------------|-------------------|
-| 获取某歌曲的所有歌单 | `JOIN song_playlist + GROUP BY` (~500ms+) | `SELECT FROM song_playlist_agg` (~1ms) |
-| 获取某歌曲的评论摘要 | MongoDB 查询 (~10ms+) | `SELECT FROM song_comment_agg` (~1ms) |
-| 批量获取100首歌曲的歌单 | 100 × JOIN 查询 | 1 次批量查询 |
-
-**性能提升**：预处理后，特征生成时的数据获取时间可从 **14秒+ 降至 <1秒**。
-
----
-
-### 3.0.4 数据更新策略
-
-1. **新增歌曲**：入库时自动写入 `song_playlist_agg`（通过触发器或应用层逻辑）
-2. **歌单变更**：歌曲被加入/移除歌单时，更新对应 `song_playlist_agg` 记录
-3. **评论更新**：定期（如每天）运行 `rebuild_song_comment_agg` 增量同步, `rebuild_song_comment_agg`尚未实现
-
----
-
-### 3.0.5 两阶段数据流说明
-
-#### 阶段划分
+### 3.0.1 两阶段数据流
 
 | 阶段 | 名称 | 触发时机 | 目的 |
 |------|------|----------|------|
-| **阶段1** | 特征生成（离线准备） | 管理员手动触发或定时任务 | 将 songs 的原始数据转换为 music_features |
-| **阶段2** | 实时推荐（用户查询） | 用户发送 query 时 | 根据用户描述返回匹配的歌曲 |
+| **阶段1** | 特征生成（离线） | 管理员手动触发 | 将 songs 原始数据转换为 music_features |
+| **阶段2** | 实时推荐（在线） | 用户发送 query 时 | 根据用户描述返回匹配的歌曲 |
 
-#### 阶段1：特征生成（离线准备）
+**阶段1：特征生成流程**
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        特征生成流程（离线批量）                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  【数据来源】                                                            │
-│  songs ──────────────→ 歌曲基本信息                                       │
-│      │                                                              │
-│      │                                                              │
-│  song_playlist ──→ playlists                                          │
-│      │                         ▲                                      │
-│      │                         │                                      │
-│      ↓                         │                                      │
-│  【预聚合表】                  │ 从原始表 JOIN 聚合而来                   │
-│  song_playlist_agg ────────────┘                                      │
-│                                                                          │
-│  MongoDB: comments                                                     │
-│      │                                                                │
-│      ↓                                                                │
-│  song_comment_agg ────────── 从 MongoDB 聚合而来                        │
-│                                                                          │
-│  【特征生成】                                                           │
-│  songs + song_playlist_agg + song_comment_agg ──→ LLM 提取特征          │
-│      │                                                              │
-│      ↓                                                              │
-│  music_features ← 【核心预计算表，所有实时查询都直接读取此表】           │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+歌曲池 (songs)
+     │
+     ├──→ song_playlist_agg（歌单预聚合）
+     │         ▲ 从 songs + playlists JOIN 聚合而来
+     │
+     ├──→ song_comment_agg（评论预聚合）
+     │         ▲ 从 MongoDB comments 聚合而来
+     │
+     ▼
+songs + 预聚合表 ──→ LLM 提取特征 ──→ music_features
+```
+
+**阶段2：实时推荐流程**
+
+```
+用户输入 query
+     │
+     ▼
+SELECT * FROM music_features ORDER BY RANDOM() LIMIT 500
+     │ 【直接查询，无任何 JOIN】
+     ▼
+LLM 语义匹配 ──→ 返回结果
 ```
 
 **重要说明**：
-- 特征生成阶段使用 `song_playlist_agg` 和 `song_comment_agg` 作为辅助表
-- 特征生成完成后，`music_features` 表存储了所有必要的特征
-- **实时推荐阶段不会 JOIN 任何表**，直接读取 `music_features`
-
-#### 阶段2：实时推荐（用户查询）
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        实时推荐流程（用户查询）                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  用户输入: "欢快的凯尔特音乐"                                             │
-│      │                                                                  │
-│      ↓                                                                  │
-│  SELECT * FROM music_features ORDER BY RANDOM() LIMIT 500               │
-│      │                                                                  │
-│      │  【直接查询，无任何 JOIN】                                         │
-│      ↓                                                                  │
-│  构建候选歌曲上下文                                                       │
-│      │                                                                  │
-│      ↓                                                                  │
-│  LLM 语义匹配                                                            │
-│      │                                                                  │
-│      ↓                                                                  │
-│  返回匹配结果                                                            │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-**重要说明**：
-- 实时查询**只读取 `music_features` 表**，不访问任何其他表
-- 不需要 JOIN `song_playlist_agg`、`song_comment_agg` 或 `songs` 表
+- 实时查询只读取 `music_features` 表，不访问任何其他表
 - 所有必要信息已在 `music_features` 中预计算完毕
 
 ---
 
-### 3.0.6 预聚合表生成操作指南
+### 3.0.2 特征生成方式
 
-#### 前提条件
+#### 方式一：API 接口（在线）
 
-确保数据库中存在以下原始表：
-- `songs`（歌曲表）
-- `playlists`（歌单表）
-- `song_playlist`（歌曲-歌单关联表）
-- `comments`（MongoDB 中的评论集合）
-
----
-
-#### Step 1：创建 song_playlist_agg 表
-
-**1.1 创建表**
-
-执行 `database/schema.sql` 中的建表语句。
-
-**1.2 填充数据（从 PostgreSQL 聚合）**
+启动后端服务后，通过 HTTP 请求触发：
 
 ```bash
-cd /home/luke/code_project/musicRecommend
-~/miniconda3/envs/music/bin/python scripts/init_song_playlist_agg.py
-```
-
-**预期结果**：
-- 生成约 121 万条记录（与 songs 表行数相同）
-- 执行时间：约 5-15 分钟（取决于数据量）
-
-**1.3 验证数据**
-
-```sql
--- 检查数据完整性
-SELECT
-    COUNT(*) as total_songs,
-    COUNT(*) FILTER (WHERE playlist_names IS NOT NULL AND array_length(playlist_names, 1) > 0) as songs_with_playlists,
-    COUNT(*) FILTER (WHERE playlist_names IS NULL OR array_length(playlist_names, 1) = 0) as songs_without_playlists
-FROM song_playlist_agg;
-
--- 查看样例数据
-SELECT song_id, playlist_names, playlist_count
-FROM song_playlist_agg
-WHERE array_length(playlist_names, 1) > 0
-LIMIT 5;
-```
-
----
-
-#### Step 2：创建 song_comment_agg 表
-
-**2.1 创建表**
-
-执行 `database/schema.sql` 中的建表语句。
-
-**2.2 填充数据（从 MongoDB 同步）**
-
-```bash
-cd /home/luke/code_project/musicRecommend
-~/miniconda3/envs/music/bin/python scripts/init_song_comment_agg.py
-```
-
-**预期结果**：
-- 生成约 12.4 万条记录（与有评论的歌曲数相同）
-- 执行时间：约 10-20 分钟（取决于 MongoDB 查询速度）
-
-**2.3 验证数据**
-
-```sql
--- 检查数据完整性
-SELECT
-    COUNT(*) as total_songs_with_comments,
-    AVG(comment_count) as avg_comment_count,
-    AVG(avg_polarity) as avg_polarity
-FROM song_comment_agg;
-
--- 查看样例数据
-SELECT song_id, comment_count, top_comments, avg_polarity
-FROM song_comment_agg
-LIMIT 5;
-```
-
----
-
-#### Step 3：生成 music_features 表
-
-> **重要**：完成 `song_playlist_agg` 和 `song_comment_agg` 的生成后，才能开始生成 `music_features`。
-
-**LLM 选择说明（速度 vs 质量）**：
-
-| LLM 选项 | 速度 | 质量 | 适用场景 |
-|----------|------|------|----------|
-| **MiniMax API（云端）** | ~15-20秒/首 | 高 | 首次大规模生成，推荐使用 |
-| **本地模型（如 Qwen、ChatGLM）** | ~3-5秒/首 | 中 | 小规模或频繁更新场景 |
-| **本地 Embedding + 规则** | ~0.1秒/首 | 低 | 快速但质量较低的占位方案 |
-
-**MiniMax API 生成（高质量，推荐首次使用）**
-
-```bash
-# 批量生成特征（约 12.4 万首有评论的歌曲）
 for i in {1..124}; do
-  echo "Batch $i/124 started at $(date)"
   curl -s -X POST http://localhost:5000/api/features/generate \
     -H "Content-Type: application/json" \
     -d '{"batch_size": 1000}' > /dev/null
-  echo "Batch $i/124 completed at $(date)"
   sleep 1
 done
-
-# 检查生成进度
-PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
 ```
 
-**预计耗时**：约 6-10 分钟（124 次 × 3-5 秒/次 + 网络延迟）
+#### 方式二：Python 脚本（离线）
 
-**本地模型生成（快速，但质量较低）**
-
-如果选择本地模型（如 Qwen2-7B），需要修改 `llm_service.py` 中的配置：
-
-```python
-# backend/services/llm_service.py
-
-class LLMService:
-    def __init__(self):
-        # 选择 1: MiniMax API（质量高，速度慢）
-        # self.client = OpenAI(
-        #     api_key=os.getenv("LLM_PROVIDER_KEY"),
-        #     base_url=os.getenv("LLM_PROVIDER_URL")
-        # )
-        # self.model = os.getenv("LLM_MODEL_NAME", "MiniMax-M2.7")
-
-        # 选择 2: 本地模型（速度快，质量中）
-        self.client = OpenAI(
-            api_key="local",
-            base_url="http://localhost:11434/v1"  # Ollama 默认地址
-        )
-        self.model = "qwen2:7b"  # 或其他本地模型
-
-        # 选择 3: 基于 Embedding 的快速方案（速度极快，质量低）
-        # self.embedding_model = "text-embedding-ada-002"
-```
-
-**本地模型优缺点**：
-- ✅ 速度快（3-5秒/首 vs 15-20秒/首）
-- ✅ 无需网络调用
-- ✅ 可离线运行
-- ❌ 质量较低，特征提取可能不够准确
-- ❌ 需要本地部署 LLM（Ollama 或其他）
-
-**混合方案（推荐用于生产环境）**
-
-```
-阶段1：使用本地快速模型生成基础特征
-阶段2：对关键歌曲（高播放量、高评论）使用云端模型重新生成
-```
-
-**使用独立脚本填充（最简单的方式）**
-
-提供了独立脚本 `scripts/init_music_feature.py`，无需启动后端服务，可直接执行填充。
+直接执行脚本，无需启动后端：
 
 ```bash
 cd /home/luke/code_project/musicRecommend
-~/miniconda3/envs/music/bin/python scripts/init_music_feature.py
+~/miniconda3/envs/music/bin/python scripts/init_music_feature_vllm.py
 ```
 
-**脚本工作流程：**
-1. 从 `song_playlist_agg` 和 `song_comment_agg` 预聚合表读取歌曲信息（无需实时 JOIN）
-2. 逐首调用 LLM 生成特征（使用环境变量中的 `LLM_PROVIDER_KEY`、`LLM_PROVIDER_URL`、`LLM_MODEL_NAME`）
-3. 将特征 upsert 到 `music_features` 表
-4. 每处理 100 首输出一次进度
-
-**环境变量配置（通过 `~/.env` 或后端 `.env`）：**
-| 变量名 | 说明 | 示例 |
-|--------|------|------|
-| `LLM_PROVIDER_KEY` | API 密钥 | `your-api-key` |
-| `LLM_PROVIDER_URL` | API 地址 | `https://api.minimax.io/v1` |
-| `LLM_MODEL_NAME` | 模型名称 | `MiniMax-M2.7` |
-
-**进度查询：**
-```bash
-# 检查已填充的记录数
-PGPASSWORD=luke psql -h localhost -U postgres -d musicdb -c "SELECT COUNT(*) FROM music_features;"
-```
+> 详细操作指南、表格结构、数据验证方法见 [3_0_数据特征提取.md](./3_0_数据特征提取.md)
 
 ---
 
