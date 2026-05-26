@@ -306,49 +306,268 @@ LIMIT 100;
 songs + 预聚合表 ──→ LLM 提取特征 ──→ music_features
 ```
 
-**阶段2：实时推荐流程**
+**阶段2：实时推荐流程（召回 + 精排两阶段设计）**
 
 ```
 用户输入 query
      │
      ▼
-SELECT * FROM music_features ORDER BY RANDOM() LIMIT 500
-     │ 【直接查询，无任何 JOIN】
+┌─────────────────────────────────────────────────────────────┐
+│  【阶段1：粗召回】向量数据库检索                              │
+│  • 使用文本 Embedding 模型将 query 转为向量                  │
+│  • 在向量数据库中检索最相似的 top 100-200 首歌曲              │
+│  • 毫秒级响应，支持百万级曲库                                │
+└─────────────────────────────────────────────────────────────┘
+     │
      ▼
-LLM 语义匹配 ──→ 返回结果
+┌─────────────────────────────────────────────────────────────┐
+│  【阶段2：精排序】LLM 语义匹配                               │
+│  • 将召回的 100-200 首歌曲构建上下文                        │
+│  • 使用 LLM 进行精细排序和匹配                              │
+│  • 输出最终的 top 20 结果及匹配理由                         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
+**两阶段设计的原因**：
+
+| 设计考量 | 粗召回阶段 | 精排序阶段 |
+|----------|------------|------------|
+| **使用技术** | Embedding + 向量数据库 | LLM 语义理解 |
+| **处理数据量** | 全曲库（百万级）→ 召回 100-200 首 | 100-200 首 → 返回 20 首 |
+| **性能要求** | 毫秒级响应 | 可接受 1-2 秒 |
+| **精准度** | 粗略筛选，召回相关歌曲 | 精确理解用户意图 |
+| **LLM 介入** | ❌ 不使用 | ✅ 使用 |
+
+**为什么不能全用 LLM**：
+- 成本问题：LLM 调用成本高，处理百万歌曲不可行
+- 速度问题：LLM 推理速度慢，无法满足实时性要求
+- 上下文限制：LLM 上下文窗口有限，无法处理大规模候选集
+
+**为什么精排必须用 LLM**：
+- 向量检索只能找到"相似"的歌曲，但"相似"不等于"符合用户意图"
+- 用户的查询可能非常复杂（文学创作、情感描述等），需要语义理解
+- LLM 可以提供匹配理由，提升用户体验
+
 **重要说明**：
-- 实时查询只读取 `music_features` 表，不访问任何其他表
-- 所有必要信息已在 `music_features` 中预计算完毕
+- 实时查询只读取向量数据库和 `music_features` 表，不访问 songs 等其他表
+- 向量已在特征生成阶段提前计算完毕，实时查询只需做向量检索
 
 ---
 
-### 3.0.2 特征生成方式
+### 3.0.2 特征生成方式（Embedding + 文本特征双轨制）
 
-#### 方式一：API 接口（在线）
+由于大规模歌曲特征提取（LLM）不可行，本项目采用**双轨制特征生成**：
 
-启动后端服务后，通过 HTTP 请求触发：
+#### 轨道1：Embedding 向量生成（必须，大规模可行）
 
+**目的**：为向量数据库检索提供向量数据
+
+**执行方式**：
 ```bash
-for i in {1..124}; do
-  curl -s -X POST http://localhost:5000/api/features/generate \
-    -H "Content-Type: application/json" \
-    -d '{"batch_size": 1000}' > /dev/null
-  sleep 1
-done
+cd /home/luke/code_project/musicRecommend
+~/miniconda3/envs/music/bin/python scripts/generate_embeddings.py
 ```
 
-#### 方式二：Python 脚本（离线）
+**说明**：
+- 使用文本 Embedding 模型（如 MiniMaxEmbedding、text-embedding-3-small 等）
+- 将歌曲的文本描述（歌名、歌手、风格、情绪、场景等）转换为 1536 维向量
+- **此步骤可行于大规模数据集**：每首歌约 0.1 秒，百万首歌约 1-2 天完成
+- 向量数据直接写入向量数据库（pgvector 或 Qdrant）
 
-直接执行脚本，无需启动后端：
+#### 轨道2：LLM 文本特征生成（可选，用于增强检索）
 
+**目的**：补充 LLM 提取的语义标签（genre、mood、scene 等），丰富 metadata
+
+**执行方式**：
 ```bash
 cd /home/luke/code_project/musicRecommend
 ~/miniconda3/envs/music/bin/python scripts/init_music_feature_vllm.py
 ```
 
-> 详细操作指南、表格结构、数据验证方法见 [3_0_数据特征提取.md](./3_0_数据特征提取.md)
+**说明**：
+- 对于超大规模数据集（如百万级），此步骤**仅对小样本（如 1-2 万首）执行**
+- LLM 文本特征用于补充 metadata，不承担主要检索功能
+- 可用于基于标签的过滤、分类统计等辅助功能
+
+#### 双轨制的检索流程
+
+```
+查询 "欢快的凯尔特音乐"
+     │
+     ▼
+【阶段1：向量检索】Embedding(query) → 向量数据库 → top 100-200 候选
+     │
+     ▼
+【阶段2：精排序】(可选) LLM 对候选重排序 → 最终 top 20
+```
+
+**详细操作指南、表格结构、数据验证方法见 [3_0_数据特征提取.md](./3_0_数据特征提取.md)**
+
+---
+
+### 3.0.3 复杂查询的完整搜索流程（示例）
+
+**用户查询**："欢快的凯尔特音乐，有小提琴伴奏"
+
+#### 完整处理流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 步骤1：查询预处理                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│ 输入："欢快的凯尔特音乐，有小提琴伴奏"                               │
+│ 输出：将查询转换为 Embedding 向量（1536维）                          │
+│ 工具：Embedding 模型（如 MiniMax Embedding API）                   │
+└─────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 步骤2：向量数据库粗召回（阶段1）                                      │
+├─────────────────────────────────────────────────────────────────┤
+│ 输入：查询向量（1536维）                                             │
+│ 操作：在 song_embeddings 表中计算余弦相似度                        │
+│ SQL：SELECT * FROM song_embeddings                               │
+│     ORDER BY embedding <=> query_vector LIMIT 200               │
+│ 输出：最相似的 200 首歌曲（基于向量相似度）                           │
+│ 特点：                                                            │
+│  - 毫秒级响应                                                    │
+│  - 仅基于语义相似度，不理解复杂逻辑                                 │
+│  - 可能召回"欢快的"或"凯尔特"但不一定两者都满足                     │
+└─────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 步骤3：LLM 精排序（阶段2）                                           │
+├─────────────────────────────────────────────────────────────────┤
+│ 输入：                                                            │
+│  - 用户原始查询："欢快的凯尔特音乐，有小提琴伴奏"                     │
+│  - 200 首候选歌曲的完整信息（歌名、艺术家、genre、mood、           │
+│    instruments、scene、description 等）                           │
+│                                                                  │
+│ 操作：调用 LLM 进行语义匹配                                        │
+│ Prompt 示例：                                                     │
+│ """                                                              │
+│ 用户查询："欢快的凯尔特音乐，有小提琴伴奏"                            │
+│                                                                  │
+│ 候选歌曲（200首）：                                                 │
+│ 1. 歌名：Ye Netherlands, 艺术家：Johan Wagenaar                   │
+│    genre：古典, mood：欢快,激昂, instruments：管弦乐,弦乐            │
+│    description：这是一首充满欢快节奏的管弦乐作品...                 │
+│                                                                  │
+│ 2. 歌名：Celtic Dreams, 艺术家：Irish Orchestra                   │
+│    genre：凯尔特,新世纪, mood：欢快,轻快, instruments：小提琴,竖琴    │
+│    description：典型的凯尔特风格，小提琴旋律优美...                  │
+│ ...                                                              │
+│                                                                  │
+│ 请分析每首歌曲与用户查询的匹配度，重点关注：                         │
+│ 1. 是否为凯尔特风格（Celtic）                                      │
+│ 2. 情绪是否欢快（mood含"欢快"、"轻快"等）                           │
+│ 3. 是否有小提琴伴奏（instruments含"小提琴"或"violin"）              │
+│                                                                  │
+│ 返回 JSON 格式，包含 top 20 匹配歌曲：                              │
+│ {                                                                │
+│   "matched_songs": [                                             │
+│     {                                                            │
+│       "song_id": 123,                                            │
+│       "match_score": 0.95,                                       │
+│       "match_reason": "典型的凯尔特风格，情绪欢快，                  │
+│                        小提琴旋律贯穿全曲，完美符合用户要求"        │
+│     }                                                            │
+│   ]                                                              │
+│ }                                                                │
+│ """                                                              │
+│                                                                  │
+│ 输出：精排序后的 top 20 歌曲 + 匹配理由                             │
+│ 特点：                                                            │
+│  - 理解复杂语义："欢快的" AND "凯尔特" AND "小提琴"                 │
+│  - 可以解释匹配原因                                               │
+│  - 响应时间 1-2 秒                                                │
+└─────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 步骤4：返回最终结果                                                │
+├─────────────────────────────────────────────────────────────────┤
+│ 返回给前端的 JSON：                                                │
+│ {                                                                │
+│   "success": true,                                               │
+│   "query": "欢快的凯尔特音乐，有小提琴伴奏",                         │
+│   "results": [                                                   │
+│     {                                                            │
+│       "song_id": 123,                                            │
+│       "song_name": "Celtic Dreams",                              │
+│       "artist": "Irish Orchestra",                               │
+│       "match_score": 0.95,                                       │
+│       "match_reason": "典型的凯尔特风格，情绪欢快，小提琴旋律贯穿全曲"│
+│     }                                                            │
+│   ],                                                             │
+│   "total": 20                                                    │
+│ }                                                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 关键点说明
+
+**1. 基本搜索 vs 复杂搜索对比**
+
+| 搜索类型 | 实现方式 | 示例查询 | LLM参与阶段 |
+|----------|----------|----------|------------|
+| **基本搜索** | 直接 SQL ILIKE 模糊匹配 | "琵琶行"、"周杰伦" | ❌ 不参与 |
+| **语义搜索** | Embedding 向量检索 | "适合工作的轻音乐" | ❌ 不参与 |
+| **复杂搜索** | 向量召回 + LLM 精排 | "欢快的凯尔特音乐，有小提琴伴奏" | ✅ 仅精排阶段 |
+
+**2. 为什么需要两阶段**
+
+- **只用数据库ILIKE**：无法理解"欢快"、"凯尔特"、"小提琴"的语义关系
+  ```sql
+  -- 传统方式（无效）
+  SELECT * FROM songs
+  WHERE song_name ILIKE '%凯尔特%'
+     OR artist ILIKE '%小提琴%'  -- 无法匹配乐器信息
+  ```
+
+- **只用向量检索**：可以找到"相似"的歌曲，但无法保证同时满足多个条件
+  - 可能召回"欢快的古典音乐"（缺少凯尔特）
+  - 可能召回"凯尔特纯音乐"（缺少小提琴）
+
+- **两阶段方案**：
+  - 阶段1：向量数据库快速缩小范围（百万 → 200）
+  - 阶段2：LLM 精确理解"欢快 AND 凯尔特 AND 小提琴"的复杂逻辑
+
+**3. LLM 参与时机总结**
+
+| 场景 | LLM 是否参与 | 原因 | 替代方案 |
+|------|-------------|------|---------|
+| **离线特征生成** | ❌ 不参与（已废弃） | 百万歌曲 × LLM成本太高，时间太慢 | 用纯Embedding方案 |
+| **实时粗召回（阶段1）** | ❌ 不参与 | 向量数据库负责，毫秒级响应 | Embedding向量检索 |
+| **实时精排序（阶段2）** | ✅ 参与 | 仅对200首候选排序，1-2秒可接受 | 理解复杂语义逻辑 |
+
+**4. 数据流总结**
+
+```
+【离线阶段（一次性）】
+  songs表 → 拼接文本描述 → 生成Embedding向量 → song_embeddings表
+  （不使用LLM，仅用Embedding模型）
+
+【实时查询（每次用户搜索）】
+  用户query → Embedding → 向量检索（top 200） → LLM精排 → top 20
+  （LLM仅在精排阶段参与，不参与粗召回）
+```
+
+**5. 为什么不在第一阶段使用LLM生成music_feature**
+
+原设计中考虑过用LLM生成`music_features`表的`genre`、`mood`、`instruments`等字段，但有以下问题：
+
+| 问题 | 说明 | 解决方案 |
+|------|------|---------|
+| **成本太高** | 百万歌曲 × LLM调用 ≈ 巨额费用 | 仅用Embedding模型（每首0.1秒） |
+| **时间太慢** | 每首3-5秒 × 100万 ≈ 34-58天 | Embedding并行处理，1-2天完成 |
+| **不必要** | 向量检索已足够精准 | LLM仅用于精排200首候选 |
+
+**当前方案优势**：
+- ✅ 离线阶段：纯Embedding方案，成本低、速度快、可扩展
+- ✅ 实时查询：LLM只处理200首，成本可控、延迟可接受
+- ✅ 效果保证：复杂查询通过LLM精排实现，简单查询纯向量即可
 
 ---
 
@@ -613,61 +832,196 @@ playback_completion_rate = (playback_duration_seconds / song_duration_seconds) *
 
 ---
 
-### 3.3 数据库存储选型分析
+### 3.3 向量数据库设计（核心组件）
 
-#### 3.3.1 music_features 表存储选择：PostgreSQL vs 向量数据库
+#### 3.3.1 向量数据库：核心召回引擎
 
-**核心问题**：music_features 表中的 `feature_vector` 向量字段应该存在哪里？
+**重要变更**：向量数据库不再是"可选扩展"，而是**核心召回引擎**。
 
-**方案对比：**
+在新的两阶段推荐架构中：
+- **阶段1（粗召回）**：完全依赖向量数据库，支持百万级曲库的快速检索
+- **阶段2（精排序）**：使用 LLM 对召回结果进行精细排序
 
-| 维度 | PostgreSQL + pgvector | 专用向量数据库（Milvus/Pinecone等） |
-|------|------------------------|--------------------------------------|
+#### 3.3.2 向量数据库选型
+
+| 维度 | PostgreSQL + pgvector | 专用向量数据库（Qdrant/Milvus） |
+|------|------------------------|----------------------------------|
 | **架构复杂度** | ⭐⭐ 低（单数据库） | ⭐⭐⭐⭐ 高（需维护独立服务） |
 | **成本** | ⭐⭐ 低（无需额外服务） | ⭐⭐⭐⭐ 高（云服务或自建集群） |
-| **查询性能** | ⭐⭐⭐ 中等 | ⭐⭐⭐⭐⭐ 优秀（针对向量优化） |
+| **查询性能** | ⭐⭐⭐ 中等（百万级 < 100ms） | ⭐⭐⭐⭐⭐ 优秀 |
 | **扩展性** | ⭐⭐ 受限于PostgreSQL | ⭐⭐⭐⭐⭐ 按需扩展 |
 | **运维成本** | ⭐⭐ 低 | ⭐⭐⭐⭐ 高 |
 | **适用规模** | 百万级向量 | 千万级以上 |
 
-**本项目建议：PostgreSQL + pgvector（初版）→ 专用向量数据库（扩展）**
+**本项目建议：PostgreSQL + pgvector（初版/中期）→ Qdrant（扩展）**
 
-理由：
-1. **初版规模预估**：假设曲库10万首歌曲，向量维度1536
-   - 总存储：10万 × 1536 × 4字节 ≈ 600MB
-   - PostgreSQL 完全可承载
-
-2. **pgvector 能力**：
-   - 支持向量相似度搜索（余弦相似度、欧氏距离）
+**理由**：
+1. **pgvector 能力已足够**：
+   - 支持向量相似度搜索（余弦相似度、欧氏距离、L2距离）
    - 支持 HNSW 和 IVFFlat 索引
    - 可处理百万级向量，延迟 < 100ms
+   - 与现有 PostgreSQL 统一管理，运维简单
 
-3. **运维简化**：与现有 PostgreSQL 统一管理，降低复杂度
+2. **扩展路径清晰**（预留）：
+   - 如果未来曲库规模超过 500 万首，或需要更高的召回精度
+   - 可平滑迁移到 Qdrant（轻量、易用、Rust 实现）
+   - 迁移时只需将向量数据导出，再导入新数据库
 
-4. **扩展路径**（预留）：
-   - 如果未来曲库规模超过500万首，或需要更高的召回精度
-   - 可平滑迁移到专用向量数据库（如 Qdrant、Milvus）
-   - 迁移时只需将 `feature_vector` 数据导出，再导入到新数据库
+#### 3.3.3 向量数据库表设计
 
-**扩展为专用向量数据库的判断条件：**
+**方案A：pgvector 内置于 PostgreSQL（推荐初版）**
+
+```sql
+-- 启用 pgvector 扩展
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 创建歌曲向量表（独立于 music_features，用于向量检索）
+CREATE TABLE song_embeddings (
+    id SERIAL PRIMARY KEY,
+    song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
+
+    -- 文本描述（用于生成向量和调试）
+    text_description TEXT NOT NULL,  -- 拼接的歌名、艺术家、风格、情绪、场景等
+
+    -- 向量表示（1536维，与 Embedding 模型对齐）
+    embedding vector(1536),
+
+    -- 元数据（用于过滤和辅助排序）
+    genre VARCHAR(100),
+    mood VARCHAR(200),
+    scene VARCHAR(200),
+    language VARCHAR(50),
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 创建 HNSW 索引（适合追求查询速度的场景，召回阶段首选）
+CREATE INDEX idx_song_embeddings_hnsw
+ON song_embeddings USING hnsw (embedding vector_cosine_ops);
+
+-- 索引设计：元数据索引，支持混合检索（向量检索 + 标签过滤）
+CREATE INDEX idx_song_embeddings_genre ON song_embeddings(genre);
+CREATE INDEX idx_song_embeddings_mood ON song_embeddings(mood);
+CREATE INDEX idx_song_embeddings_scene ON song_embeddings(scene);
+```
+
+**方案B：Qdrant（扩展用，向量数据库独立部署）**
+
+```python
+# Qdrant 集合设计
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+
+client = QdrantClient(host="localhost", port=6333)
+
+# 创建集合
+client.recreate_collection(
+    collection_name="song_embeddings",
+    vectors_config=VectorParams(size=1536, distance=Distance.COSINE)
+)
+
+# 写入向量（批量）
+client.upsert(
+    collection_name="song_embeddings",
+    points=[
+        PointStruct(
+            id=song["song_id"],
+            vector=song["embedding"],
+            payload={
+                "song_name": song["song_name"],
+                "artist": song["artist"],
+                "genre": song["genre"],
+                "mood": song["mood"],
+                "scene": song["scene"]
+            }
+        )
+        for song in songs
+    ]
+)
+```
+
+#### 3.3.4 Embedding 生成流程
+
+**目的**：将歌曲文本转换为向量，存储到向量数据库
+
+**文本描述拼接规则**：
+```
+text_description = f"{song_name} {artist} {album} {playlist_names} {comment_summary}"
+```
+
+**示例**：
+- 歌曲："Dance of the Knights", 艺术家："Sergei Prokofiev", 专辑："Romeo & Juliet"
+- 歌单："【古典】战斗进行曲 · 史诗级配乐", "【古典】管弦乐合集"
+- 文本描述：`"Dance of the Knights Sergei Prokofiev Romeo & Juliet 【古典】战斗进行曲 · 史诗级配乐 【古典】管弦乐合集"`
+
+**Embedding 生成脚本**（待实现）：
+```bash
+cd /home/luke/code_project/musicRecommend
+~/miniconda3/envs/music/bin/python scripts/generate_embeddings.py
+```
+
+**脚本实现要点**：
+1. 从 `song_playlist_agg` 和 `song_comment_agg` 获取歌曲文本描述
+2. 调用 Embedding API（如 MiniMax Embedding）生成向量
+3. 批量写入 `song_embeddings` 表或 Qdrant
+
+#### 3.3.5 向量检索流程（阶段1：粗召回）
+
+**pgvector 检索示例**：
+```sql
+-- 1. 将用户查询转换为向量
+--    此步骤在应用层完成，使用 Embedding API
+-- 2. 在 PostgreSQL 中进行向量检索
+SELECT
+    se.song_id,
+    se.song_name,
+    se.artist,
+    1 - (se.embedding <=> '[query_embedding]') AS similarity
+FROM song_embeddings se
+ORDER BY se.embedding <=> '[query_embedding]'
+LIMIT 100;
+```
+
+**带标签过滤的混合检索**：
+```sql
+-- 召回"欢快"且"凯尔特"风格的歌曲
+SELECT
+    se.song_id,
+    se.song_name,
+    se.artist,
+    1 - (se.embedding <=> '[query_embedding]') AS similarity
+FROM song_embeddings se
+WHERE se.mood LIKE '%欢快%'
+  AND (se.genre LIKE '%凯尔特%' OR se.text_description LIKE '%凯尔特%')
+ORDER BY se.embedding <=> '[query_embedding]'
+LIMIT 100;
+```
+
+#### 3.3.6 扩展为专用向量数据库的判断条件
 
 | 判断条件 | 操作 |
 |----------|------|
-| 曲库规模 > 500万首 | 考虑迁移到 Qdrant/Milvus |
+| 曲库规模 > 500 万首 | 考虑迁移到 Qdrant |
 | 向量检索延迟 > 200ms | 升级到专用向量库 |
-| 需要更复杂的向量检索（如混合检索） | 升级到专用向量库 |
+| 需要更复杂的向量检索（如混合检索、重排序） | 升级到专用向量库 |
 | 团队有余力维护独立服务 | 可提前升级 |
 
-**扩展时的数据迁移脚本（预留）：**
+#### 3.3.7 从 pgvector 迁移到 Qdrant
 
+**迁移脚本（预留）**：
 ```python
-# 迁移脚本伪代码
-def migrate_to_qdrant():
+def migrate_pgvector_to_qdrant():
     # 1. 从 PostgreSQL 导出向量数据
-    vectors = db.query("SELECT song_id, feature_vector FROM music_features WHERE feature_vector IS NOT NULL")
+    songs = db.query("SELECT song_id, embedding, song_name, artist, genre, mood, scene FROM song_embeddings WHERE embedding IS NOT NULL")
 
     # 2. 写入 Qdrant
-    qdrant.upsert_batch(collection_name="music_features", vectors=vectors)
+    qdrant.upsert_batch(collection_name="song_embeddings", points=[
+        PointStruct(id=song["song_id"], vector=song["embedding"], payload={
+            "song_name": song["song_name"], "artist": song["artist"],
+            "genre": song["genre"], "mood": song["mood"], "scene": song["scene"]
+        }) for song in songs
+    ])
 
     # 3. 修改代码中的向量检索逻辑
     # vector_db = QdrantVectorDB()  # 替换 pgvector
@@ -675,50 +1029,7 @@ def migrate_to_qdrant():
 
 ---
 
-**pgvector 配置示例：**
-
-```sql
--- 启用 pgvector 扩展
-CREATE EXTENSION IF NOT EXISTS vector;
-
--- 添加向量列（1536维，与 MiniMax embedding 维度对齐）
-ALTER TABLE music_features ADD COLUMN feature_vector vector(1536);
-
--- 创建 HNSW 索引（适合追求查询速度的场景）
-CREATE INDEX idx_music_features_vector_hnsw
-ON music_features USING hnsw (feature_vector vector_cosine_ops);
-
--- 或创建 IVFFlat 索引（适合数据量大、内存受限的场景）
-CREATE INDEX idx_music_features_vector_ivfflat
-ON music_features USING ivfflat (feature_vector vector_cosine_ops);
-```
-
-**是否启用向量检索的判断流程：**
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     向量检索启用判断                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  曲库规模 <= 100万首？                                          │
-│         │                                                        │
-│    是 ◄─┴─► 否                                                  │
-│    │         │                                                   │
-│    ▼         ▼                                                   │
-│  PostgreSQL  考虑专用向量数据库                                  │
-│  + pgvector                                                │
-│                                                                  │
-│  是否需要高精度召回？                                            │
-│    是 ◄─┴─► 否                                                  │
-│    │         │                                                   │
-│    ▼         ▼                                                   │
-│  pgvector   纯标签匹配足够                                       │
-│  HNSW索引                                                       │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
+#### 3.3.8 推荐历史与反馈存储选择
 
 #### 3.3.2 推荐历史与反馈存储选择：数据量大时的应对策略
 
@@ -1221,7 +1532,7 @@ export default {
 - 只需一个能接受 OpenAI 格式请求的 API（MiniMax、OpenAI、Claude 等均可）
 - 代码层使用通用 HTTP 调用或 OpenAI 兼容库，不依赖专用 SDK
 
-> **注意**：初版使用纯 LLM 推荐（随机采样 + LLM 语义匹配），不依赖 Embedding 模型，所以 embedding 相关配置本节先跳过。
+> **注意**：本项目使用 Embedding + 向量数据库方案，无需随机采样，详见 3.3 节。
 
 **执行步骤**：
 
@@ -1259,10 +1570,11 @@ export default {
    print(resp.json())
    ```
 
-3. **确认 embedding 模型**（初版跳过）：
-   - 初版采用纯 LLM 推荐方案，不使用 Embedding/向量检索
-   - 特征匹配通过"随机采样约500首候选歌曲 + LLM 直接语义匹配"实现
-   - Embedding 向量检索作为后续扩展方向，详见 3.3.1 节
+3. **确认 embedding 模型**（必须）：
+   - 本项目使用 Embedding + 向量数据库进行粗召回
+   - embedding 模型用于将用户查询和歌曲文本转换为向量
+   - 向量数据库（如 pgvector）负责高速检索 top 100-200 候选
+   - LLM 在精排序阶段使用，负责精细排序
 
 **配置建议**：
 
@@ -1272,6 +1584,11 @@ export default {
 LLM_PROVIDER_URL = 'https://api.minimax.chat'
 LLM_PROVIDER_KEY = 'your_api_key'
 LLM_MODEL_NAME = 'abab6.5s-chat'
+
+# Embedding 配置（用于向量检索）
+EMBEDDING_PROVIDER_URL = 'https://api.minimax.chat'
+EMBEDDING_API_KEY = 'your_embedding_key'
+EMBEDDING_MODEL_NAME = 'embedding模型名'
 
 # 如果以后切换到其他模型商（如 OpenAI），只需修改配置：
 # LLM_PROVIDER_URL = 'https://api.openai.com/v1'
@@ -1675,165 +1992,37 @@ class FeatureService:
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         # 执行插入...
+#### 6.3.3 推荐服务核心逻辑（两阶段：召回 + 精排）
 
-    def search_by_tags(self, tags: List[str], limit: int = 20) -> List[Dict]:
-        """基于标签搜索歌曲"""
-        # 使用 PostgreSQL 的 LIKE 或数组包含查询
-        # ...
-```
+**目标**：创建 backend/services/recommend_service.py，实现两阶段推荐算法
 
-#### 6.3.3 推荐服务核心逻辑
+**推荐算法设计（两阶段架构）**：
 
-**目标**：创建 `backend/services/recommend_service.py`，实现推荐算法
+> **为什么使用两阶段架构？**
+>
+> - **问题**：全量 LLM 匹配无法支持大规模曲库（百万级歌曲）
+> - **解决方案**：向量数据库负责高速召回 + LLM 负责精确排序
 
-**推荐算法设计说明（初版纯 LLM 方案）**：
+**两阶段流程**：
 
-> **为什么不使用 Embedding/向量检索？**
->
-> 初版采用**纯文本语义匹配**方案，不依赖 Embedding 模型，流程如下：
->
-> 1. **获取候选歌曲**：从 `music_features` 表随机采样约 500 首候选歌曲
-> 2. **构建上下文字符串**：将候选歌曲的文本特征（名称、艺术家、风格、情绪、场景）拼接为一段文本
-> 3. **LLM 直接匹配**：将用户查询和候选歌曲文本一起发送给 LLM，让 LLM 直接输出匹配的歌曲
->
-> ```
-> 用户: "欢快的凯尔特音乐"
->        │
->        ▼
-> 候选歌曲文本（最多100首）:
-> "song_id: 123, 名称: X, 风格: 古典, 情绪: 欢快, 场景: 夜晚"
-> "song_id: 456, 名称: Y, 风格: 凯尔特, 情绪: 欢快, 场景: 聚会"
->        │
->        ▼
-> LLM 返回匹配结果（JSON）
-> ```
->
-> **优点**：
-> - 无需 Embedding 模型，成本低
-> - 实现简单，快速验证
-> - LLM 具备语义理解能力，可处理复杂查询
->
-> **限制**：
-> - 受限于 LLM 上下文窗口，每次最多处理约 100 首歌曲
-> - 曲库规模大时无法遍历全部歌曲
->
-> **扩展方向**：当曲库规模超过 10 万首或需要更高召回率时，可升级为**向量检索方案**（使用 Embedding 模型 + pgvector），详见 3.3.1 节。
+
 
 **recommend_service.py 实现要点**：
-```python
-# backend/services/recommend_service.py
 
-from typing import List, Dict, Optional
-import time
-from .llm_service import LLMService
-from .feature_service import FeatureService
+Backend service implementing two-stage recommendation:
+- Stage 1: Vector search (coarse recall)
+- Stage 2: LLM rerank (fine ranking)
 
-class RecommendService:
-    def __init__(self, db_connection):
 
-    def recommend(self, query: str, session_id: str = None,
-                  max_results: int = 20, user_id: str = None) -> Dict:
-        """核心推荐方法"""
 
-        start_time = time.time()
+**向量检索配置（pgvector）**：
 
-        # 1. 识别查询类型
-        query_type = self.classify_query(query)
 
-        # 2. 获取候选歌曲（从 music_features 表）
-        candidates = self.get_candidates(query_type)
 
-        # 3. 构建上下文，让 LLM 匹配
-        songs_context = self.build_songs_context(candidates)
+**扩展：纯向量检索**：
 
-        # 4. 调用 LLM 进行语义匹配
-        match_result = self.llm_match(query, songs_context)
+对于简单查询或性能敏感场景，可以跳过 LLM 精排，直接返回向量检索结果。
 
-        # 5. 记录推荐历史
-        history_id = self.save_history(
-        )
-
-        # 6. 构建返回结果
-        return self.build_response(
-        )
-
-    def classify_query(self, query: str) -> str:
-        """识别查询类型"""
-        # 简单场景描述 -> simple
-        # 复杂情感描述 -> complex
-        # 古诗词 -> poem
-        # 语音输入 -> voice
-        if len(query) < 20 and any(kw in query for kw in ['音乐', '歌曲']):
-            return 'simple'
-        elif any(char in query for char in ['，', '。', '、', '兮', '吾']):
-            return 'poem'
-        return 'complex'
-
-    def get_candidates(self, query_type: str, limit: int = 500) -> List[Dict]:
-        """获取候选歌曲"""
-        # 从 music_features 表获取候选
-        # 注意：随机采样约 500 首，但 build_songs_context 只会使用前 100 首
-        # 这是因为 LLM 上下文窗口有限，无法处理过多歌曲
-        query = """
-            SELECT mf.*, s.song_name, s.artist, s.album, s.music_file
-            FROM music_features mf
-            JOIN songs s ON mf.song_id = s.song_id
-            ORDER BY RANDOM()
-            LIMIT %s
-        """
-        # 执行查询并返回...
-
-    def build_songs_context(self, candidates: List[Dict]) -> str:
-        """构建发送给 LLM 的歌曲上下文"""
-        context_lines = []
-        for song in candidates[:100]:  # 限制数量，避免 token 过多
-            line = f"song_id: {song['song_id']}, " \
-                   f"名称: {song['song_name']}, " \
-                   f"艺术家: {song['artist']}, " \
-                   f"风格: {song.get('genre', '未知')}, " \
-                   f"情绪: {song.get('mood', '未知')}, " \
-                   f"场景: {song.get('scene', '未知')}"
-            context_lines.append(line)
-        return "\n".join(context_lines)
-
-    def llm_match(self, query: str, songs_context: str) -> List[Dict]:
-        """LLM 语义匹配"""
-        prompt = self.llm.match_songs_prompt(query, songs_context)
-        response = self.llm.chat([{"role": "user", "content": prompt}])
-
-        # 解析返回的 JSON
-        result = json.loads(response)
-        return result.get('matched_songs', [])
-
-    def build_response(self, query: str, query_type: str,
-                      matches: List[Dict], history_id: int,
-                      latency_ms: int) -> Dict:
-        """构建 API 响应"""
-        # 填充完整的歌曲信息...
-        results = []
-        for match in matches:
-            song = self.get_song_detail(match['song_id'])
-            results.append({
-                "song_id": song['song_id'],
-                "song_name": song['song_name'],
-                "artist": song['artist'],
-                "album": song['album'],
-                "music_file": song['music_file'],
-                "match_score": match['match_score'],
-                "match_reason": match.get('match_reason', ''),
-                "tags": [song.get('genre', ''), song.get('mood', '')]
-            })
-
-        return {
-            "success": True,
-            "query": query,
-            "query_type": query_type,
-            "results": results,
-            "total": len(results),
-            "history_id": history_id,
-            "latency_ms": latency_ms
-        }
-```
 
 #### 6.3.4 API 路由开发
 
