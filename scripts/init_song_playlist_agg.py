@@ -66,14 +66,14 @@ def init_song_playlist_agg():
                 ARRAY_AGG(DISTINCT p.playlist_name) FILTER (WHERE p.playlist_name IS NOT NULL),
                 ARRAY_AGG(DISTINCT p.category) FILTER (WHERE p.category IS NOT NULL),
                 COUNT(DISTINCT sp.playlist_id),
-                STRING_AGG(DISTINCT p.playlist_name, ', ') FILTER (WHERE p.playlist_name IS NOT NULL),
-                STRING_AGG(DISTINCT p.category, ', ') FILTER (WHERE p.category IS NOT NULL)
+                STRING_AGG(DISTINCT p.playlist_name, '##') FILTER (WHERE p.playlist_name IS NOT NULL),
+                STRING_AGG(DISTINCT p.category, '##') FILTER (WHERE p.category IS NOT NULL)
             FROM songs s
             LEFT JOIN song_playlist sp ON s.song_id = sp.song_id
             LEFT JOIN playlists p ON sp.playlist_id = p.playlist_id
             GROUP BY s.song_id
         """)
-
+        #用 ## 来拼接字段 而不是,  这个有歧义， 本身歌单名字中就包含,
         conn.commit()
         elapsed = time.time() - start_time
         print(f"      聚合完成，耗时: {elapsed:.1f} 秒")

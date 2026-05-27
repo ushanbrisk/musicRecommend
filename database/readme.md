@@ -9,7 +9,7 @@
 | 项目 | 表结构来源 | 包含的表 |
 |------|-----------|----------|
 | 原有项目 | `music-project/database/schema.sql` | songs, playlists, artists, song_playlist, comments, male_artists, female_artists, artist_songs_relation |
-| 本项目 | `musicRecommend/database/schema.sql` | music_features, recommendation_history, recommendation_feedback |
+| 本项目 | `musicRecommend/database/schema.sql` | song_playlist_agg, song_comment_agg, song_embeddings, music_features, recommendation_history, recommendation_feedback |
 
 两套表结构**共存于同一个数据库**，通过 `song_id` 外键关联。
 
@@ -41,20 +41,25 @@ psql -h localhost -U postgres -d musicdb
 
 ```sql
 -- 检查表是否存在
-\dt music_features recommendation_history recommendation_feedback
+\dt music_features recommendation_history recommendation_feedback song_embeddings
 
 -- 验证表结构
 \d music_features
 \d recommendation_history
 \d recommendation_feedback
+\d song_embeddings
 
 -- 测试查询（应返回空结果但无报错）
 SELECT COUNT(*) FROM music_features LIMIT 1;
 SELECT COUNT(*) FROM recommendation_history LIMIT 1;
 SELECT COUNT(*) FROM recommendation_feedback LIMIT 1;
+SELECT COUNT(*) FROM song_embeddings LIMIT 1;
 ```
 
 ## 表结构说明
+
+### song_embeddings
+存储歌曲的向量表示，用于推荐系统的阶段1向量召回。包含 text_description（文本描述）和 embedding（向量）字段。
 
 ### music_features
 存储歌曲的特征信息，用于推荐系统匹配。
@@ -73,4 +78,21 @@ SELECT COUNT(*) FROM recommendation_feedback LIMIT 1;
 DROP TABLE IF EXISTS recommendation_feedback;
 DROP TABLE IF EXISTS recommendation_history;
 DROP TABLE IF EXISTS music_features;
+DROP TABLE IF EXISTS song_embeddings;
+DROP TABLE IF EXISTS song_comment_agg;
+DROP TABLE IF EXISTS song_playlist_agg;
 ```
+
+## 向量数据初始化
+
+song_embeddings 表需要通过 Embedding API 生成向量数据，请参见 init_song_embeddings.py 脚本：
+
+```bash
+# 1. 先确保 song_playlist_agg 表已填充数据
+~/miniconda3/envs/music/bin/python scripts/init_song_playlist_agg.py
+
+# 2. 再生成向量数据
+~/miniconda3/envs/music/bin/python scripts/init_song_embeddings.py
+```
+
+执行前请确保 .env 文件中已配置 EMBEDDING_API_KEY、EMBEDDING_PROVIDER_URL 等环境变量。

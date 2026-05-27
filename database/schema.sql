@@ -6,6 +6,11 @@
 -- 两套表结构共存于同一数据库，通过 song_id 外键关联
 
 -- ============================================
+-- 0. 启用 pgvector 扩展（向量检索必需）
+-- ============================================
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- ============================================
 -- 3.0 预聚合表（避免实时 JOIN，提升查询性能）
 -- ============================================
 
@@ -58,6 +63,42 @@ CREATE TABLE IF NOT EXISTS song_comment_agg (
 
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_song_comment_agg_song_id ON song_comment_agg(song_id);
+
+-- ============================================
+-- 6.1 阶段一：song_embeddings 向量表
+-- ============================================
+-- 存储歌曲的向量表示，用于向量检索（阶段1粗召回）
+-- 向量维度为 1536，与 Embedding 模型对齐
+
+CREATE TABLE IF NOT EXISTS song_embeddings (
+    id SERIAL PRIMARY KEY,
+    song_id BIGINT UNIQUE NOT NULL REFERENCES songs(song_id),
+
+    -- 文本描述（用于生成向量和调试）
+    text_description TEXT NOT NULL,
+
+    -- 向量表示（1536维，与 Embedding 模型对齐）
+    embedding vector(1536),
+
+    -- 元数据（用于过滤和辅助排序，在向量召回时可选使用）
+    genre VARCHAR(100),
+    mood VARCHAR(200),
+    scene VARCHAR(200),
+    language VARCHAR(50),
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- HNSW 索引（高效向量检索，适合追求查询速度的场景）
+CREATE INDEX IF NOT EXISTS idx_song_embeddings_hnsw
+ON song_embeddings USING hnsw (embedding vector_cosine_ops);
+
+-- 元数据索引（支持混合检索：向量检索 + 标签过滤）
+CREATE INDEX IF NOT EXISTS idx_song_embeddings_genre ON song_embeddings(genre);
+CREATE INDEX IF NOT EXISTS idx_song_embeddings_mood ON song_embeddings(mood);
+CREATE INDEX IF NOT EXISTS idx_song_embeddings_scene ON song_embeddings(scene);
+CREATE INDEX IF NOT EXISTS idx_song_embeddings_song_id ON song_embeddings(song_id);
 
 -- ============================================
 -- 3.1 音乐特征表 (music_features)
