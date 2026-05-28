@@ -3,15 +3,30 @@
 初始化 song_embeddings 表
 
 将 songs 表的数据结合 song_playlist_agg 表生成文本描述，
-然后通过 Embedding API 生成向量，存储到 song_embeddings 表。
+然后通过 Embedding API 或本地模型生成向量，存储到 song_embeddings 表。
+
+支持两种方案：
+- Plan A (默认)：调用 Embedding API 服务
+- Plan B：使用本地 GPU 部署的模型，通过 song_id % 6 分组并行
 
 使用方法:
+    # Plan A (API 方案)
     ~/miniconda3/envs/music/bin/python scripts/init_song_embeddings.py
+
+    # Plan B (本地 GPU 方案)
+    EMBEDDING_USE_LOCAL=true GPU_GROUP=0 ~/miniconda3/envs/music/bin/python scripts/init_song_embeddings.py
+
+    # 同时跑 6 个卡
+    EMBEDDING_USE_LOCAL=true GPU_GROUP=0 python scripts/init_song_embeddings.py &
+    EMBEDDING_USE_LOCAL=true GPU_GROUP=1 python scripts/init_song_embeddings.py &
+    # ... 以此类推
+
 
 注意:
     1. 需要先创建 song_embeddings 表，参见 database/schema.sql
-    2. 需要配置 .env 文件中的 Embedding API 相关环境变量
-    3. 建议先执行 init_song_playlist_agg.py 确保歌单数据已就绪
+    2. Plan A 需要配置 .env 文件中的 Embedding API 相关环境变量
+    3. Plan B 需要安装 requirements.txt 中的依赖包
+    4. 建议先执行 init_song_playlist_agg.py 确保歌单数据已就绪
 """
 
 import os
@@ -24,19 +39,24 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import psycopg2
-from openai import OpenAI
 
 # 加载环境变量
 env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
 load_dotenv(env_path)
 
-# 初始化 Embedding 客户端
-embedding_client = OpenAI(
-    api_key=os.getenv('EMBEDDING_API_KEY'),
-    base_url=os.getenv('EMBEDDING_PROVIDER_URL')
-)
+# ==================== 配置 ====================
+
+# 是否使用本地模型
+USE_LOCAL = os.getenv('EMBEDDING_USE_LOCAL', 'false').lower() == 'true'
+
+# GPU 分组编号 (0-5)，通过环境变量指定，用于 song_id % 6 分组
+GPU_GROUP = int(os.getenv('GPU_GROUP', '0'))
 
 EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL_NAME')
+
+# 本地模型名称（可通过环境变量配置）
+LOCAL_EMBEDDING_MODEL = os.getenv('LOCAL_EMBEDDING_MODEL', 'BAAI/bge-m3')
+
 
 def get_db_connection():
     """获取数据库连接"""
@@ -49,11 +69,22 @@ def get_db_connection():
     )
 
 
-def generate_embedding(text: str):
+# ==================== Plan A: API 方案 ====================
+
+def setup_api_client():
+    """初始化 API 客户端"""
+    from openai import OpenAI
+    return OpenAI(
+        api_key=os.getenv('EMBEDDING_API_KEY'),
+        base_url=os.getenv('EMBEDDING_PROVIDER_URL')
+    )
+
+
+def generate_embedding_api(text: str, client, model: str):
     """调用 Embedding API 生成向量"""
     try:
-        response = embedding_client.embeddings.create(
-            model=EMBEDDING_MODEL,
+        response = client.embeddings.create(
+            model=model,
             input=text,
             encoding_format="float"
         )
@@ -62,6 +93,95 @@ def generate_embedding(text: str):
         print(f"    Embedding API 错误: {e}")
         return None
 
+
+# ==================== Plan B: 本地 GPU 方案 ====================
+
+def setup_local_model():
+    """初始化本地模型"""
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+
+    # 根据 GPU_GROUP 选择使用的 GPU
+    device = f"cuda:{GPU_GROUP}" if torch.cuda.is_available() else "cpu"
+
+    print(f"    加载模型: {LOCAL_EMBEDDING_MODEL}")
+    print(f"    使用设备: {device}")
+
+    tokenizer = AutoTokenizer.from_pretrained(LOCAL_EMBEDDING_MODEL, trust_remote_code=True)
+    model = AutoModel.from_pretrained(LOCAL_EMBEDDING_MODEL, trust_remote_code=True)
+    model.to(device)
+    model.eval()
+
+    return model, tokenizer, device
+
+'''
+可以验证向量是否归一化
+SELECT
+    COUNT(*) AS total_rows,
+    COUNT(*) FILTER (
+        WHERE ABS(vector_norm(embedding) - 1.0) < 1e-6
+    ) AS normalized_rows
+FROM song_embeddings;
+'''
+
+
+def mean_pooling(model_output, attention_mask):
+    """Mean Pooling - 考虑 attention mask 的平均池化"""
+    import torch
+    token_embeddings = model_output[0]
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+
+def generate_embedding_local(text: str, model, tokenizer, device: str):
+    """使用本地模型生成向量"""
+    import torch
+    try:
+        encoded_input = tokenizer(text, padding=True, truncation=True, max_length=1024, return_tensors='pt')
+        encoded_input = {k: v.to(device) for k, v in encoded_input.items()}
+
+        with torch.no_grad():
+            model_output = model(**encoded_input)
+
+        embedding = mean_pooling(model_output, encoded_input['attention_mask'])
+        # L2 归一化
+        embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
+
+        return embedding[0].cpu().numpy().tolist()
+    except Exception as e:
+        print(f"    本地模型推理错误: {e}")
+        return None
+
+
+# ==================== 初始化（根据方案选择） ====================
+
+api_client = None
+local_model = None
+local_tokenizer = None
+local_device = None
+
+if USE_LOCAL:
+    print("=" * 60)
+    print("使用 Plan B: 本地 GPU 方案")
+    print(f"GPU 分组: {GPU_GROUP} (处理 song_id % 6 == {GPU_GROUP} 的歌曲)")
+    print("=" * 60)
+    local_model, local_tokenizer, local_device = setup_local_model()
+else:
+    print("=" * 60)
+    print("使用 Plan A: API 方案")
+    print("=" * 60)
+    api_client = setup_api_client()
+
+
+def generate_embedding(text: str):
+    """生成向量的统一接口，根据配置选择 API 或本地模型"""
+    if USE_LOCAL:
+        return generate_embedding_local(text, local_model, local_tokenizer, local_device)
+    else:
+        return generate_embedding_api(text, api_client, EMBEDDING_MODEL)
+
+
+# ==================== 通用函数 ====================
 
 def clean_text(text: str) -> str:
     """基础清洗：去除特殊字符、多余空白"""
@@ -114,7 +234,13 @@ def init_song_embeddings(batch_size=1000):
     print("=" * 60)
     print("song_embeddings 向量生成开始")
     print("=" * 60)
-    print(f"Embedding 模型: {EMBEDDING_MODEL}")
+    if USE_LOCAL:
+        print(f"方案: Plan B (本地 GPU)")
+        print(f"模型: {LOCAL_EMBEDDING_MODEL}")
+        print(f"GPU 分组: {GPU_GROUP}")
+    else:
+        print(f"方案: Plan A (API)")
+        print(f"Embedding 模型: {EMBEDDING_MODEL}")
     print(f"批次大小: {batch_size}")
     print()
 
@@ -130,11 +256,20 @@ def init_song_embeddings(batch_size=1000):
         cursor.execute("SELECT COUNT(*) FROM song_embeddings WHERE embedding IS NOT NULL")
         existing_count = cursor.fetchone()[0]
 
-        cursor.execute("""
-            SELECT COUNT(*) FROM songs s
-            LEFT JOIN song_embeddings se ON s.song_id = se.song_id
-            WHERE (se.id IS null or (se.id IS not null and se.embedding is null))
-        """)
+        # Plan B: 只统计当前 GPU 分组对应的歌曲
+        if USE_LOCAL:
+            cursor.execute("""
+                SELECT COUNT(*) FROM songs s
+                LEFT JOIN song_embeddings se ON s.song_id = se.song_id
+                WHERE MOD(s.song_id, 6) = %s
+                  AND (se.id IS null or (se.id IS not null and se.embedding is null))
+            """, (GPU_GROUP,))
+        else:
+            cursor.execute("""
+                SELECT COUNT(*) FROM songs s
+                LEFT JOIN song_embeddings se ON s.song_id = se.song_id
+                WHERE (se.id IS null or (se.id IS not null and se.embedding is null))
+            """)
         pending_count = cursor.fetchone()[0]
 
         print(f"    歌曲总数: {total_songs:,}")
@@ -147,27 +282,45 @@ def init_song_embeddings(batch_size=1000):
 
         # 2. 批量获取待处理的歌曲
         print("\n[2/4] 开始生成向量...")
-        print("    (按 Enter 继续，按 Ctrl+C 取消)")
+        print("    (按 Ctrl+C 取消)")
 
         processed = 0
         batch_num = 0
 
         while True:
             # 获取一批待处理的歌曲
-            cursor.execute("""
-                SELECT
-                    s.song_id,
-                    s.song_name,
-                    s.artist,
-                    s.album,
-                    spa.playlist_names_str,
-                    spa.playlist_categories_str
-                FROM songs s
-                LEFT JOIN song_embeddings se ON s.song_id = se.song_id
-                LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
-                WHERE (se.id IS null or (se.id IS not null and se.embedding is null))
-                LIMIT %s
-            """, (batch_size,))
+            # Plan B: 添加 song_id % 6 过滤
+            if USE_LOCAL:
+                cursor.execute("""
+                    SELECT
+                        s.song_id,
+                        s.song_name,
+                        s.artist,
+                        s.album,
+                        spa.playlist_names_str,
+                        spa.playlist_categories_str
+                    FROM songs s
+                    LEFT JOIN song_embeddings se ON s.song_id = se.song_id
+                    LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
+                    WHERE MOD(s.song_id, 6) = %s
+                      AND (se.id IS null or (se.id IS not null and se.embedding is null))
+                    LIMIT %s
+                """, (GPU_GROUP, batch_size))
+            else:
+                cursor.execute("""
+                    SELECT
+                        s.song_id,
+                        s.song_name,
+                        s.artist,
+                        s.album,
+                        spa.playlist_names_str,
+                        spa.playlist_categories_str
+                    FROM songs s
+                    LEFT JOIN song_embeddings se ON s.song_id = se.song_id
+                    LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
+                    WHERE (se.id IS null or (se.id IS not null and se.embedding is null))
+                    LIMIT %s
+                """, (batch_size,))
 
             rows = cursor.fetchall()
 
@@ -230,8 +383,9 @@ def init_song_embeddings(batch_size=1000):
                     speed = i / elapsed if elapsed > 0 else 0
                     print(f"      已处理 {i}/{len(rows)} 首 (速度: {speed:.1f} 首/秒)")
 
-                # 避免 API 限流
-                time.sleep(0.05)
+                # 避免 API 限流（Plan A 需要，Plan B 可适当调大）
+                if not USE_LOCAL:
+                    time.sleep(0.05)
 
             batch_elapsed = time.time() - batch_start
             print(f"    批次完成: {processed} 首, 耗时: {batch_elapsed:.1f} 秒")

@@ -374,6 +374,25 @@ cd /home/luke/code_project/musicRecommend
 - **此步骤可行于大规模数据集**：每首歌约 0.1 秒，百万首歌约 1-2 天完成
 - 向量数据直接写入向量数据库（pgvector 或 Qdrant）
 
+**双方案支持**：
+
+- **Plan A（API方案）**：调用 Embedding API 服务（如 MiniMax Embedding）
+  - 优点：部署简单，无需本地 GPU
+  - 缺点：API 有频率限制，可能断连
+
+- **Plan B（本地 GPU 方案）**：使用本地部署的 Embedding 模型
+  - 硬件：3 张 3090 (24G) + 3 张 3080 (20G)，共 6 卡并行
+  - 并行策略：`song_id % 6` 分组，每张卡处理对应的歌曲
+  - 优点：稳定可靠，不依赖外部 API，可 24 小时连续运行
+  - 模型：推荐使用 `text2vec-base-chinese` 或 `moka-ai/m3e-base` 等开源模型
+  - 配置：设置环境变量 `EMBEDDING_USE_LOCAL=true` 切换到本地模型
+
+**执行方式**（Plan B）：
+```bash
+cd /home/luke/code_project/musicRecommend
+EMBEDDING_USE_LOCAL=true ~/miniconda3/envs/music/bin/python scripts/init_song_embeddings.py
+```
+
 #### 轨道2：LLM 文本特征生成（可选，用于增强检索）
 
 **目的**：补充 LLM 提取的语义标签（genre、mood、scene 等），丰富 metadata
