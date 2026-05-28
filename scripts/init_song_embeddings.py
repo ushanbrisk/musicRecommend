@@ -16,6 +16,7 @@
 
 import os
 import sys
+import re
 import time
 from dotenv import load_dotenv
 
@@ -62,43 +63,40 @@ def generate_embedding(text: str):
         return None
 
 
-def build_text_description(song_name, artist, album, playlist_names=None, playlist_categories=None):
+def clean_text(text: str) -> str:
+    """基础清洗：去除特殊字符、多余空白"""
+    text = re.sub(r"[^\w\u4e00-\u9fa5]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_by_separator(tag_str: str, sep: str = ",", top_k: int = 20) -> str:
+    """分隔 + 去重 + 截断"""
+    if not tag_str:
+        return ""
+    tags = [clean_text(t) for t in tag_str.split(sep) if t.strip()]
+    seen = set()
+    result = []
+    for t in tags:
+        if t not in seen:
+            seen.add(t)
+            result.append(t)
+        if len(result) >= top_k:
+            break
+    return " ".join(result)
+
+
+def build_text_description(song_name: str, artist: str, album: str,
+                          playlist_names=None, playlist_categories=None) -> str:
     """构建歌曲的文本描述（用于生成 embedding）"""
-    parts = []
+    # 歌单名称和分类用 ## 分割（取决于数据存储格式）
+    playlist = split_by_separator(playlist_names, sep="##", top_k=20)
+    category = split_by_separator(playlist_categories, sep="##", top_k=10)
 
-    # 歌曲名
-    if song_name:
-        parts.append(song_name)
-
-    # 艺术家
-    if artist:
-        parts.append(artist)
-
-    # 专辑
-    if album:
-        parts.append(album)
-
-    # 歌单名称（最多取5个）
-    if playlist_names:
-        if isinstance(playlist_names, str):
-            playlists = playlist_names.split('##')[:5]
-        elif isinstance(playlist_names, list):
-            playlists = playlist_names[:5]
-        else:
-            playlists = []
-        parts.extend([p.strip() for p in playlists if p.strip()])
-
-    # 歌单分类（最多取3个）
-    if playlist_categories:
-        if isinstance(playlist_categories, str):
-            categories = playlist_categories.split('##')[:3]
-        elif isinstance(playlist_categories, list):
-            categories = playlist_categories[:3]
-        else:
-            categories = []
-        parts.extend([c.strip() for c in categories if c.strip()])
-
-    return ' '.join(parts)
+    return f"歌名：{clean_text(song_name)}\n" \
+           f"作者：{clean_text(artist)}\n" \
+           f"专辑：{clean_text(album)}\n" \
+           f"类别：{category}\n" \
+           f"歌单：{playlist}"
 
 # 文本描述构建说明：
 # - 只用歌名+艺术家+专辑+歌单信息，暂不加入评论数据
