@@ -29,6 +29,12 @@ psql -h localhost -U postgres -d musicdb
 # 2. 执行 schema.sql
 \i /home/luke/code_project/musicRecommend/database/schema.sql
 
+也可以一键执行
+```
+psql -h localhost -U postgres -d musicdb -f /home/luke/code_project/musicRecommend/database/schema.sql
+```
+
+
 # 3. 验证表创建成功
 \dt music_features recommendation_history recommendation_feedback
 ```

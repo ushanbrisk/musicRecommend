@@ -365,7 +365,7 @@ songs + 预聚合表 ──→ LLM 提取特征 ──→ music_features
 **执行方式**：
 ```bash
 cd /home/luke/code_project/musicRecommend
-~/miniconda3/envs/music/bin/python scripts/generate_embeddings.py
+~/miniconda3/envs/music/bin/python scripts/init_song_embeddings.py
 ```
 
 **说明**：
@@ -958,7 +958,7 @@ text_description = f"{song_name} {artist} {album} {playlist_names} {comment_summ
 **Embedding 生成脚本**（待实现）：
 ```bash
 cd /home/luke/code_project/musicRecommend
-~/miniconda3/envs/music/bin/python scripts/generate_embeddings.py
+~/miniconda3/envs/music/bin/python scripts/init_song_embeddings.py
 ```
 
 **脚本实现要点**：

@@ -77,8 +77,8 @@ CREATE TABLE IF NOT EXISTS song_embeddings (
     -- 文本描述（用于生成向量和调试）
     text_description TEXT NOT NULL,
 
-    -- 向量表示（1536维，与 Embedding 模型对齐）
-    embedding vector(1536),
+    -- 向量表示（1024维，与 Embedding 模型对齐）
+    embedding vector(1024),
 
     -- 元数据（用于过滤和辅助排序，在向量召回时可选使用）
     genre VARCHAR(100),

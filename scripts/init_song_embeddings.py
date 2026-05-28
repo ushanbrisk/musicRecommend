@@ -133,7 +133,7 @@ def init_song_embeddings(batch_size=1000):
         cursor.execute("""
             SELECT COUNT(*) FROM songs s
             LEFT JOIN song_embeddings se ON s.song_id = se.song_id
-            WHERE se.id IS NULL
+            WHERE (se.id IS null or (se.id IS not null and se.embedding is null))
         """)
         pending_count = cursor.fetchone()[0]
 
@@ -165,7 +165,7 @@ def init_song_embeddings(batch_size=1000):
                 FROM songs s
                 LEFT JOIN song_embeddings se ON s.song_id = se.song_id
                 LEFT JOIN song_playlist_agg spa ON s.song_id = spa.song_id
-                WHERE se.id IS NULL
+                WHERE (se.id IS null or (se.id IS not null and se.embedding is null))
                 LIMIT %s
             """, (batch_size,))
 
