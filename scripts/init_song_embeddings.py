@@ -14,12 +14,16 @@
     ~/miniconda3/envs/music/bin/python scripts/init_song_embeddings.py
 
     # Plan B (本地 GPU 方案)
-    EMBEDDING_USE_LOCAL=true GPU_GROUP=0 ~/miniconda3/envs/music/bin/python scripts/init_song_embeddings.py
+    # 注意：如果本地已有模型缓存，需要设置 HF_HUB_OFFLINE=1 避免联网验证
+    HF_HUB_OFFLINE=1 EMBEDDING_USE_LOCAL=true GPU_GROUP=0 ~/miniconda3/envs/music/bin/python scripts/init_song_embeddings.py
 
-    # 同时跑 6 个卡
-    EMBEDDING_USE_LOCAL=true GPU_GROUP=0 python scripts/init_song_embeddings.py &
-    EMBEDDING_USE_LOCAL=true GPU_GROUP=1 python scripts/init_song_embeddings.py &
-    # ... 以此类推
+    # 同时跑 6 个卡（需要先设置 HF_HUB_OFFLINE=1）
+    HF_HUB_OFFLINE=1 EMBEDDING_USE_LOCAL=true GPU_GROUP=0 python scripts/init_song_embeddings.py &
+    HF_HUB_OFFLINE=1 EMBEDDING_USE_LOCAL=true GPU_GROUP=1 python scripts/init_song_embeddings.py &
+    HF_HUB_OFFLINE=1 EMBEDDING_USE_LOCAL=true GPU_GROUP=2 python scripts/init_song_embeddings.py &
+    HF_HUB_OFFLINE=1 EMBEDDING_USE_LOCAL=true GPU_GROUP=3 python scripts/init_song_embeddings.py &
+    HF_HUB_OFFLINE=1 EMBEDDING_USE_LOCAL=true GPU_GROUP=4 python scripts/init_song_embeddings.py &
+    HF_HUB_OFFLINE=1 EMBEDDING_USE_LOCAL=true GPU_GROUP=5 python scripts/init_song_embeddings.py
 
 
 注意:
@@ -27,6 +31,7 @@
     2. Plan A 需要配置 .env 文件中的 Embedding API 相关环境变量
     3. Plan B 需要安装 requirements.txt 中的依赖包
     4. 建议先执行 init_song_playlist_agg.py 确保歌单数据已就绪
+    5. 使用本地模型时，建议设置 HF_HUB_OFFLINE=1 避免网络验证问题（如果已有缓存）
 """
 
 import os
@@ -125,12 +130,13 @@ FROM song_embeddings;
 '''
 
 
-def mean_pooling(model_output, attention_mask):
-    """Mean Pooling - 考虑 attention mask 的平均池化"""
-    import torch
-    token_embeddings = model_output[0]
-    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+def cls_pooling(model_output):
+    """CLS Pooling - 取 [CLS] token 的隐藏状态作为句子向量
+
+    BGE-M3 官方推荐使用 CLS Pooling，而非 Mean Pooling。
+    CLS 从预训练起就被设计为聚合整个句子信息的特殊 token。
+    """
+    return model_output[0][:, 0, :]  # 取第一列，即 [CLS] 位置的向量
 
 
 def generate_embedding_local(text: str, model, tokenizer, device: str):
@@ -143,7 +149,8 @@ def generate_embedding_local(text: str, model, tokenizer, device: str):
         with torch.no_grad():
             model_output = model(**encoded_input)
 
-        embedding = mean_pooling(model_output, encoded_input['attention_mask'])
+        # 使用 CLS Pooling（BGE-M3 官方推荐）
+        embedding = cls_pooling(model_output)
         # L2 归一化
         embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
 
