@@ -43,8 +43,8 @@ def test_recommend():
     print(f"history_id: {result.get('history_id')}")
 
     if result.get('results'):
-        print("\n前3个结果:")
-        for i, song in enumerate(result['results'][:3], 1):
+        print("\n所有结果:")
+        for i, song in enumerate(result['results'], 1):
             print(f"\n{i}. song_id: {song.get('song_id')}")
             print(f"   歌名: {song['song_name']} - {song['artist']}")
             print(f"   匹配度: {song.get('match_score', 0)}")
@@ -68,8 +68,8 @@ def test_recommend():
     print(f"响应时间: {result.get('latency_ms')} ms")
 
     if result.get('results'):
-        print("\n前3个结果:")
-        for i, song in enumerate(result['results'][:3], 1):
+        print("\n所有结果:")
+        for i, song in enumerate(result['results'], 1):
             print(f"\n{i}. song_id: {song.get('song_id')}")
             print(f"   歌名: {song['song_name']} - {song['artist']}")
             print(f"   匹配度: {song.get('match_score', 0)}")
@@ -93,8 +93,8 @@ def test_recommend():
     print(f"响应时间: {result.get('latency_ms')} ms")
 
     if result.get('results'):
-        print("\n前3个结果:")
-        for i, song in enumerate(result['results'][:3], 1):
+        print("\n所有结果:")
+        for i, song in enumerate(result['results'], 1):
             print(f"\n{i}. song_id: {song.get('song_id')}")
             print(f"   歌名: {song['song_name']} - {song['artist']}")
             print(f"   匹配度: {song.get('match_score', 0)}")
