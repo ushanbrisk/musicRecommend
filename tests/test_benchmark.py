@@ -49,7 +49,7 @@ def benchmark_recommend():
 
         result = response.json()
         print(f"查询: {query}")
-        print(f"  响应时间: {latency:.0f} ms")
+        print(f"  响应时间: {latency:.0f} ms (总) / {result.get('llm_latency_ms', 0)} ms (LLM)")
         print(f"  结果数量: {result.get('total', 0)}")
         print(f"  成功: {result.get('success', False)}")
         print()
